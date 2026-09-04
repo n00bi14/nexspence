@@ -446,7 +446,8 @@ postgresql:
   tolerations: []
   affinity: {}
 
-# -- External PostgreSQL DSN (used when postgresql.enabled=false)
+# -- External PostgreSQL (used when postgresql.enabled=false). Prefer
+# existingSecret in production so the DSN is not stored in values.
 externalDatabase:
   # -- Prefer existingSecret below — a plaintext value here (password
   # included) tends to end up committed to a values file. Uncomment only if
