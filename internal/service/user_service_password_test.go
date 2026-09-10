@@ -98,3 +98,58 @@ func TestUserService_ChangePassword_MinLengthZero_NoEnforcement(t *testing.T) {
 
 	require.NoError(t, svc.ChangePassword(context.Background(), "alice", "old-password", "x"))
 }
+
+// ── non-local sources ─────────────────────────────────────────
+
+func TestUserService_ChangePassword_RejectsNonLocalSource(t *testing.T) {
+	for _, source := range []domain.UserSource{
+		domain.UserSourceLDAP,
+		domain.UserSourceOIDC,
+		domain.UserSourceSAML,
+	} {
+		t.Run(string(source), func(t *testing.T) {
+			u := sourceUserFixture("id-1", "sso-user", "old-password", source)
+			svc, userRepo := newPasswordSvc(t, []*domain.User{u}, 8)
+
+			// Even with the correct "old" password, an SSO/LDAP account has no
+			// writable local credential — the login path never checks the hash.
+			err := svc.ChangePassword(context.Background(), "sso-user", "old-password", "fresh-password")
+			require.Error(t, err)
+			assert.ErrorIs(t, err, service.ErrPasswordManagedExternally)
+
+			stored, err := userRepo.Get(context.Background(), "sso-user")
+			require.NoError(t, err)
+			assert.Equal(t, u.PasswordHash, stored.PasswordHash,
+				"UpdatePassword must not be reached for a non-local account")
+		})
+	}
+}
+
+func TestUserService_SetPassword_RejectsNonLocalSource(t *testing.T) {
+	for _, source := range []domain.UserSource{
+		domain.UserSourceLDAP,
+		domain.UserSourceOIDC,
+		domain.UserSourceSAML,
+	} {
+		t.Run(string(source), func(t *testing.T) {
+			// No local hash at all: an admin reset used to write one that the
+			// login flow would never check — a silent lie, now a clear error.
+			u := &domain.User{
+				ID:       "id-1",
+				Username: "sso-user",
+				Status:   domain.UserStatusActive,
+				Source:   source,
+			}
+			svc, userRepo := newPasswordSvc(t, []*domain.User{u}, 8)
+
+			err := svc.SetPassword(context.Background(), "sso-user", "fresh-password")
+			require.Error(t, err)
+			assert.ErrorIs(t, err, service.ErrPasswordManagedExternally)
+
+			stored, err := userRepo.Get(context.Background(), "sso-user")
+			require.NoError(t, err)
+			assert.Empty(t, stored.PasswordHash,
+				"UpdatePassword must not be reached for a non-local account")
+		})
+	}
+}

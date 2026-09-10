@@ -149,14 +149,22 @@ func (h *UserHandler) ChangePassword(c *gin.Context) {
 	switch {
 	case !isAdmin && callerUsername.(string) == username:
 		if err := h.svc.ChangePassword(c.Request.Context(), username, req.OldPassword, req.NewPassword); err != nil {
+			if isPasswordManagedExternally(err) {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
 	case isAdmin:
 		if err := h.svc.SetPassword(c.Request.Context(), username, req.NewPassword); err != nil {
 			// The admin branch used to answer 500 for every service error;
-			// a refused reset (short password) is the caller's fault, not
-			// the server's.
+			// a refused reset (non-local account, short password) is the
+			// caller's fault, not the server's.
+			if isPasswordManagedExternally(err) {
+				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+				return
+			}
 			if isInvalidInput(err) || isPasswordTooShort(err) {
 				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 				return

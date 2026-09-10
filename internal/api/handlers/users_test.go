@@ -482,6 +482,43 @@ func TestUserHandler_ChangePassword_OtherUser_Forbidden_403(t *testing.T) {
 	assert.Equal(t, http.StatusForbidden, rec.Code)
 }
 
+func TestUserHandler_ChangePassword_AdminResetNonLocal_403(t *testing.T) {
+	// An admin resetting an oidc account is refused server-side: the identity
+	// provider owns that credential, writing a local hash would do nothing.
+	r, users := mountChangePassword(t, "admin", []string{"nx-admin"})
+	require.NoError(t, users.Create(testContext(), &domain.User{
+		Username: "sso-user", Email: "sso@test.com",
+		Status: domain.UserStatusActive, Source: domain.UserSourceOIDC,
+	}))
+	rec := do(t, r, http.MethodPut,
+		"/service/rest/v1/security/users/sso-user/change-password", map[string]any{
+			"newPassword": "brand-new-pw",
+		})
+	require.Equal(t, http.StatusForbidden, rec.Code)
+	assert.Contains(t, rec.Body.String(), "identity provider")
+
+	stored, err := users.Get(testContext(), "sso-user")
+	require.NoError(t, err)
+	assert.Empty(t, stored.PasswordHash)
+}
+
+func TestUserHandler_SelfChangePassword_NonLocal_403(t *testing.T) {
+	// A self-change on an ldap account must answer "password is managed by
+	// the identity provider" — not bcrypt's confusing "invalid password"
+	// from the empty local hash.
+	r, users := mountSelfChangePassword(t, "ldap-user", []string{})
+	require.NoError(t, users.Create(testContext(), &domain.User{
+		Username: "ldap-user", Email: "ldap@test.com",
+		Status: domain.UserStatusActive, Source: domain.UserSourceLDAP,
+	}))
+	rec := do(t, r, http.MethodPut, "/api/v1/me/change-password", map[string]any{
+		"oldPassword": "whatever",
+		"newPassword": "brand-new-pw",
+	})
+	require.Equal(t, http.StatusForbidden, rec.Code)
+	assert.Contains(t, rec.Body.String(), "identity provider")
+}
+
 func TestUserHandler_ChangePassword_RejectsTooShort(t *testing.T) {
 	// Both verbs on a service wired with the configured minimum (as router.go
 	// does) answer 400 before anything is written.

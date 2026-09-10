@@ -31,6 +31,11 @@ var (
 	// ErrPasswordTooShort indicates a supplied password is below the configured
 	// auth.password_min_length.
 	ErrPasswordTooShort = errors.New("password too short")
+	// ErrPasswordManagedExternally indicates a password change was attempted on
+	// an account whose credential belongs to an identity provider (ldap/oidc/saml).
+	// Such accounts have no writable local password: the login flow never checks
+	// the local hash for them, so writing one would be a silent lie.
+	ErrPasswordManagedExternally = errors.New("password is managed by the identity provider")
 )
 
 // RepositoryService handles business logic for Nexus-compatible repository management.

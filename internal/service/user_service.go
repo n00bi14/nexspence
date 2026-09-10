@@ -256,6 +256,19 @@ func (s *UserService) validatePasswordLength(plain string) error {
 	return nil
 }
 
+// requireLocalPassword checks that a user's credential is actually a local
+// one before a password write. ldap/oidc/saml accounts are re-authenticated
+// by their identity provider — the login flow never compares against the
+// stored hash for them — so a "successful" local password change would be a
+// silent lie. Fail closed here, in the service, so a direct API call cannot
+// bypass it either.
+func (s *UserService) requireLocalPassword(u *domain.User) error {
+	if u.Source != domain.UserSourceLocal {
+		return fmt.Errorf("%w: %s account", ErrPasswordManagedExternally, u.Source)
+	}
+	return nil
+}
+
 // Create persists a new user, hashing plainPassword (if given) and assigning roles.
 func (s *UserService) Create(ctx context.Context, u *domain.User, plainPassword string) error {
 	if u.Username == "" {
@@ -355,6 +368,12 @@ func (s *UserService) ChangePassword(ctx context.Context, username, oldPassword,
 	if err != nil {
 		return err
 	}
+	// Before bcrypt: an ldap/oidc/saml account has an empty local hash, so the
+	// check below would answer the confusing "invalid password" instead of the
+	// truth — the identity provider owns this credential.
+	if err := s.requireLocalPassword(u); err != nil {
+		return err
+	}
 	if err := s.auth.CheckPassword(u.PasswordHash, oldPassword); err != nil {
 		return err
 	}
@@ -379,6 +398,12 @@ func (s *UserService) ChangePassword(ctx context.Context, username, oldPassword,
 func (s *UserService) SetPassword(ctx context.Context, username, newPassword string) error {
 	u, err := s.Get(ctx, username)
 	if err != nil {
+		return err
+	}
+	// Server-side, not just in the UI: resetting an SSO account used to write a
+	// local hash the login flow never checks — the reset "succeeded" and did
+	// nothing. The identity provider owns that credential.
+	if err := s.requireLocalPassword(u); err != nil {
 		return err
 	}
 	if err := s.validatePasswordLength(newPassword); err != nil {
