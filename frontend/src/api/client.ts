@@ -269,6 +269,10 @@ export const nexusApi = {
       `/service/rest/v1/security/users/${encodeURIComponent(userId)}/change-password`,
       { oldPassword, newPassword },
     ),
+  // Self-service change (avatar → Profile): always sends the current password;
+  // the route derives the target user from the session, no :userId.
+  changeMyPassword: (oldPassword: string, newPassword: string) =>
+    apiClient.put('/api/v1/me/change-password', { oldPassword, newPassword }),
 
   // Roles
   listRoles: () => apiClient.get('/service/rest/v1/security/roles'),

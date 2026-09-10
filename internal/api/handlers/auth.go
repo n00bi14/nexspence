@@ -113,6 +113,10 @@ func (h *AuthHandler) Login(c *gin.Context) {
 			"firstName": user.FirstName,
 			"lastName":  user.LastName,
 			"roles":     user.Roles,
+			// The profile modal hides the local-password section for SSO
+			// accounts; without source here the UI only learns it after a
+			// refresh (when init() refetches /api/v1/me).
+			"source": user.Source,
 		},
 	})
 }
