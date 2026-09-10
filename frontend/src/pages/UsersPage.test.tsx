@@ -459,18 +459,30 @@ describe('UsersPage', () => {
     expect(screen.getByRole('heading', { name: /Reset Password/ })).toBeInTheDocument()
   })
 
-  it('disables the reset action for an LDAP-sourced user', async () => {
+  it.each(['ldap', 'oidc', 'saml'])('disables the reset action for a %s-sourced user', async (source) => {
     server.use(
       http.get('/service/rest/v1/security/users', () =>
-        HttpResponse.json([userItem({ userId: 'ldapuser', source: 'ldap' })]),
+        HttpResponse.json([userItem({ userId: 'sso-user', source })]),
       ),
     )
     renderWithProviders(<UsersPage />)
-    await screen.findByText('ldapuser')
-    // A local password is never checked for a user the directory authenticates,
-    // so offering the action would be a dead end.
-    const btn = screen.getByTitle(/LDAP users authenticate against the directory/)
+    await screen.findByText('sso-user')
+    // The backend now refuses a local password write for any non-local source
+    // (the identity provider owns the credential), so offering the action
+    // would only produce a 403.
+    const btn = screen.getByTitle(`A ${source} account's password is managed by the identity provider`)
     expect(btn).toBeDisabled()
+  })
+
+  it('keeps the reset action enabled for a local user', async () => {
+    server.use(
+      http.get('/service/rest/v1/security/users', () =>
+        HttpResponse.json([userItem({ userId: 'alice', source: 'local' })]),
+      ),
+    )
+    renderWithProviders(<UsersPage />)
+    await screen.findByText('alice')
+    expect(screen.getByTitle('Reset password')).toBeEnabled()
   })
 
   it('edits a local user and sends the fields the API binds', async () => {

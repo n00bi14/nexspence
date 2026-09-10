@@ -390,9 +390,9 @@ export function UsersTab() {
                   title={user.source !== 'local'
                     ? `A ${user.source} account's profile is re-provisioned from the identity provider on every login`
                     : 'Edit user'}><Pencil size={14} /></HoloButton>
-                <HoloButton style={{ padding: 5 }} disabled={user.source === 'ldap'} onClick={() => setResetUser(user)}
-                  title={user.source === 'ldap'
-                    ? 'LDAP users authenticate against the directory — a local password is never checked'
+                <HoloButton style={{ padding: 5 }} disabled={user.source !== 'local'} onClick={() => setResetUser(user)}
+                  title={user.source !== 'local'
+                    ? `A ${user.source} account's password is managed by the identity provider`
                     : 'Reset password'}><KeyRound size={14} /></HoloButton>
                 <HoloButton variant="danger" style={{ padding: 5 }} disabled={user.userId === 'admin'} onClick={() => {
                   if (confirm(`Delete user "${user.userId}"?`)) deleteMutation.mutate(user.userId)
