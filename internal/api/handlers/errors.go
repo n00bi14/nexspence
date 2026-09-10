@@ -36,3 +36,9 @@ func conflictOnDuplicateName(c *gin.Context, err error) bool {
 func isInvalidInput(err error) bool {
 	return errors.Is(err, service.ErrInvalidInput)
 }
+
+// isPasswordTooShort covers a new password below auth.password_min_length —
+// a client error on every route that writes a password.
+func isPasswordTooShort(err error) bool {
+	return errors.Is(err, service.ErrPasswordTooShort)
+}

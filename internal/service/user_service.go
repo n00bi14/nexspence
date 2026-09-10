@@ -239,10 +239,31 @@ func (s *UserService) GetByID(ctx context.Context, id string) (*domain.User, err
 	return u, nil
 }
 
+// validatePasswordLength rejects a non-empty password below the configured
+// auth.password_min_length. The setting existed in config for ages and was
+// never enforced anywhere — this is the single place that gives it effect.
+// An empty password passes: provisioning paths (SSO JIT, migrated external
+// accounts) deliberately create users with no local credential, and min
+// length 0 means the auth.Service was never wired with a value.
+func (s *UserService) validatePasswordLength(plain string) error {
+	min := s.auth.MinPasswordLength()
+	if min <= 0 || plain == "" {
+		return nil
+	}
+	if len(plain) < min {
+		return fmt.Errorf("%w: must be at least %d characters", ErrPasswordTooShort, min)
+	}
+	return nil
+}
+
 // Create persists a new user, hashing plainPassword (if given) and assigning roles.
 func (s *UserService) Create(ctx context.Context, u *domain.User, plainPassword string) error {
 	if u.Username == "" {
 		return fmt.Errorf("%w: username is required", ErrInvalidInput)
+	}
+	// POST/PUT parity: the same minimum the change-password verbs enforce.
+	if err := s.validatePasswordLength(plainPassword); err != nil {
+		return err
 	}
 
 	existing, err := s.users.Get(ctx, u.Username)
@@ -337,6 +358,9 @@ func (s *UserService) ChangePassword(ctx context.Context, username, oldPassword,
 	if err := s.auth.CheckPassword(u.PasswordHash, oldPassword); err != nil {
 		return err
 	}
+	if err := s.validatePasswordLength(newPassword); err != nil {
+		return err
+	}
 	hash, err := s.auth.HashPassword(newPassword)
 	if err != nil {
 		return err
@@ -355,6 +379,9 @@ func (s *UserService) ChangePassword(ctx context.Context, username, oldPassword,
 func (s *UserService) SetPassword(ctx context.Context, username, newPassword string) error {
 	u, err := s.Get(ctx, username)
 	if err != nil {
+		return err
+	}
+	if err := s.validatePasswordLength(newPassword); err != nil {
 		return err
 	}
 	hash, err := s.auth.HashPassword(newPassword)

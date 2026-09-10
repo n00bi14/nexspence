@@ -28,6 +28,9 @@ var (
 	ErrProvisioningRejected = errors.New("provisioning rejected")
 	// ErrProvisioningConflict indicates an SSO login conflicts with an existing user's source.
 	ErrProvisioningConflict = errors.New("user source conflict")
+	// ErrPasswordTooShort indicates a supplied password is below the configured
+	// auth.password_min_length.
+	ErrPasswordTooShort = errors.New("password too short")
 )
 
 // RepositoryService handles business logic for Nexus-compatible repository management.

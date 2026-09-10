@@ -481,3 +481,59 @@ func TestUserHandler_ChangePassword_OtherUser_Forbidden_403(t *testing.T) {
 		})
 	assert.Equal(t, http.StatusForbidden, rec.Code)
 }
+
+func TestUserHandler_ChangePassword_RejectsTooShort(t *testing.T) {
+	// Both verbs on a service wired with the configured minimum (as router.go
+	// does) answer 400 before anything is written.
+	mount := func(t *testing.T, caller string, roles []string) (*gin.Engine, *testutil.UserRepo) {
+		t.Helper()
+		users := testutil.NewUserRepo()
+		roleRepo := testutil.NewRoleRepo()
+		authSvc := auth.NewService("test-secret-32-chars-long-here!!", 1, 4).WithMinPasswordLength(8)
+		h := handlers.NewUserHandler(service.NewUserService(users, roleRepo, authSvc, zap.NewNop().Sugar()))
+		r := gin.New()
+		wrap := func(c *gin.Context) {
+			c.Set("username", caller)
+			c.Set("roles", roles)
+			h.ChangePassword(c)
+		}
+		r.PUT("/service/rest/v1/security/users/:userId/change-password", wrap)
+		r.PUT("/api/v1/me/change-password", wrap)
+		return r, users
+	}
+
+	t.Run("admin reset", func(t *testing.T) {
+		r, users := mount(t, "admin", []string{"nx-admin"})
+		require.NoError(t, users.Create(testContext(), &domain.User{
+			Username: "target", Email: "target@test.com",
+			Status: domain.UserStatusActive, Source: domain.UserSourceLocal,
+		}))
+		rec := do(t, r, http.MethodPut,
+			"/service/rest/v1/security/users/target/change-password", map[string]any{
+				"newPassword": "short",
+			})
+		require.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, rec.Body.String(), "too short")
+
+		stored, err := users.Get(testContext(), "target")
+		require.NoError(t, err)
+		assert.Empty(t, stored.PasswordHash)
+	})
+
+	t.Run("self change", func(t *testing.T) {
+		r, users := mount(t, "self", []string{})
+		authSvc := auth.NewService("test-secret-32-chars-long-here!!", 1, 4)
+		hash, err := authSvc.HashPassword("old-password")
+		require.NoError(t, err)
+		require.NoError(t, users.Create(testContext(), &domain.User{
+			Username: "self", Email: "self@test.com", PasswordHash: hash,
+			Status: domain.UserStatusActive, Source: domain.UserSourceLocal,
+		}))
+		rec := do(t, r, http.MethodPut, "/api/v1/me/change-password", map[string]any{
+			"oldPassword": "old-password",
+			"newPassword": "short",
+		})
+		require.Equal(t, http.StatusBadRequest, rec.Code)
+		assert.Contains(t, rec.Body.String(), "too short")
+	})
+}

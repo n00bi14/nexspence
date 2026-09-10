@@ -154,6 +154,13 @@ func (h *UserHandler) ChangePassword(c *gin.Context) {
 		}
 	case isAdmin:
 		if err := h.svc.SetPassword(c.Request.Context(), username, req.NewPassword); err != nil {
+			// The admin branch used to answer 500 for every service error;
+			// a refused reset (short password) is the caller's fault, not
+			// the server's.
+			if isInvalidInput(err) || isPasswordTooShort(err) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
