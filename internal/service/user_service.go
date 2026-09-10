@@ -246,12 +246,12 @@ func (s *UserService) GetByID(ctx context.Context, id string) (*domain.User, err
 // accounts) deliberately create users with no local credential, and min
 // length 0 means the auth.Service was never wired with a value.
 func (s *UserService) validatePasswordLength(plain string) error {
-	min := s.auth.MinPasswordLength()
-	if min <= 0 || plain == "" {
+	minLen := s.auth.MinPasswordLength()
+	if minLen <= 0 || plain == "" {
 		return nil
 	}
-	if len(plain) < min {
-		return fmt.Errorf("%w: must be at least %d characters", ErrPasswordTooShort, min)
+	if len(plain) < minLen {
+		return fmt.Errorf("%w: must be at least %d characters", ErrPasswordTooShort, minLen)
 	}
 	return nil
 }
