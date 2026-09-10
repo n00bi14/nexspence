@@ -246,6 +246,27 @@ func TestUserHandler_Create_MissingUsername_400(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, rec.Code)
 }
 
+func TestUserHandler_Create_PasswordTooShort_400(t *testing.T) {
+	// POST parity with the change-password verbs: on a service wired with the
+	// configured minimum (as router.go does), a short initial password is a
+	// 400 — not the 500 an unmapped service error used to produce.
+	users := testutil.NewUserRepo()
+	authSvc := auth.NewService("test-secret-32-chars-long-here!!", 1, 4).WithMinPasswordLength(8)
+	h := handlers.NewUserHandler(service.NewUserService(users, testutil.NewRoleRepo(), authSvc, zap.NewNop().Sugar()))
+	r := gin.New()
+	r.POST("/service/rest/v1/security/users", h.Create)
+	rec := do(t, r, http.MethodPost, "/service/rest/v1/security/users", map[string]any{
+		"userId":   "tiny",
+		"password": "short",
+	})
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	assert.Contains(t, rec.Body.String(), "too short")
+
+	got, err := users.Get(testContext(), "tiny")
+	require.ErrorIs(t, err, repository.ErrNotFound)
+	assert.Nil(t, got)
+}
+
 func TestUserHandler_Create_Duplicate_409(t *testing.T) {
 	r, users, _ := mountUsers(t)
 	require.NoError(t, users.Create(testContext(), &domain.User{

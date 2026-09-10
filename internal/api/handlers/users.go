@@ -69,7 +69,7 @@ func (h *UserHandler) Create(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 			return
 		}
-		if isInvalidInput(err) {
+		if isInvalidInput(err) || isPasswordTooShort(err) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
