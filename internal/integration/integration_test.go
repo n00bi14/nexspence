@@ -75,6 +75,9 @@ func server(t *testing.T) *httptest.Server {
 		cfg.Auth.JWTSecret = "integration-test-secret-32bytes!!"
 		cfg.Auth.JWTExpiryHours = 1
 		cfg.Auth.BcryptCost = 4
+		// Production gets this from the viper default; a zero-value config
+		// here would mean "not wired" and skip the min-length enforcement.
+		cfg.Auth.PasswordMinLength = 8
 		cfg.Storage.Local.BasePath = t.TempDir()
 		cfg.HTTP.BaseURL = baseURL
 		cfg.HTTP.MaxBodyMB = 64 // a zero-value config means "0 bytes", not "unlimited"
@@ -167,6 +170,61 @@ func TestLoginAndMe(t *testing.T) {
 	var me map[string]any
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&me))
 	assert.Equal(t, "admin", me["username"])
+}
+
+// TestSelfChangePassword covers the profile-modal flow end to end: a local
+// user changes their own password, the change revokes the caller's own JWT
+// (tokens_valid_after is bumped server-side), and only the new password
+// logs in afterwards.
+func TestSelfChangePassword(t *testing.T) {
+	admin := login(t, "admin", "admin123")
+
+	body := `{"userId":"pw-change-eve","emailAddress":"pw-change-eve@example.com","password":"firstPass123!","status":"active","roles":[]}`
+	createResp := authReq(t, http.MethodPost, "/service/rest/v1/security/users", bytes.NewBufferString(body), admin)
+	createResp.Body.Close()
+	require.Equal(t, http.StatusCreated, createResp.StatusCode)
+	t.Cleanup(func() {
+		d := authReq(t, http.MethodDelete, "/service/rest/v1/security/users/pw-change-eve", nil, admin)
+		d.Body.Close()
+	})
+	// Same second-granularity tokens_valid_after race as TestAssetGetByID.
+	_, err := pgtest.Pool(t).Exec(context.Background(),
+		`UPDATE users SET tokens_valid_after = now() - interval '1 minute' WHERE username = 'pw-change-eve'`)
+	require.NoError(t, err)
+
+	eve := login(t, "pw-change-eve", "firstPass123!")
+
+	// Too short for the wired default minimum (8) — refused before any write.
+	shortResp := authReq(t, http.MethodPut, "/api/v1/me/change-password",
+		bytes.NewBufferString(`{"oldPassword":"firstPass123!","newPassword":"tiny"}`), eve)
+	shortResp.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, shortResp.StatusCode)
+
+	chgResp := authReq(t, http.MethodPut, "/api/v1/me/change-password",
+		bytes.NewBufferString(`{"oldPassword":"firstPass123!","newPassword":"secondPass456!"}`), eve)
+	chgResp.Body.Close()
+	require.Equal(t, http.StatusNoContent, chgResp.StatusCode)
+
+	// The change revoked every session, including the caller's own — a live
+	// UI would 401 on its next call, which is why it logs the user out.
+	meResp := authReq(t, http.MethodGet, "/api/v1/me", nil, eve)
+	meResp.Body.Close()
+	assert.Equal(t, http.StatusUnauthorized, meResp.StatusCode)
+
+	// The login path must also see the revocation (second-granularity iat
+	// would otherwise let a token minted in the same second pass).
+	_, err = pgtest.Pool(t).Exec(context.Background(),
+		`UPDATE users SET tokens_valid_after = now() - interval '1 minute' WHERE username = 'pw-change-eve'`)
+	require.NoError(t, err)
+
+	oldLogin, err := http.Post(server(t).URL+"/api/v1/login", "application/json",
+		bytes.NewBufferString(`{"username":"pw-change-eve","password":"firstPass123!"}`))
+	require.NoError(t, err)
+	oldLogin.Body.Close()
+	assert.Equal(t, http.StatusUnauthorized, oldLogin.StatusCode)
+
+	newToken := login(t, "pw-change-eve", "secondPass456!")
+	require.NotEmpty(t, newToken)
 }
 
 func TestRepositoryCRUD(t *testing.T) {
