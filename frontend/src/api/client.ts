@@ -67,6 +67,9 @@ export interface AuthConfig {
   samlIdpMetadataUrl?: string
   samlProvisioning?: string
   samlMetadataUrl?: string
+  // auth.password_min_length, mirrored by the password forms. Optional: a
+  // server predating the field omits it, and 0 means the setting is unwired.
+  passwordMinLength?: number
 }
 
 export interface ServiceStatus {

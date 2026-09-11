@@ -10,6 +10,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import styles from './Layout.module.css'
 import { useAuthStore } from '@/store/authStore'
 import { apiClient, nexusApi, apiErrorMessage } from '@/api/client'
+import { usePasswordMinLength, tooShort, passwordTooShortMessage } from '@/hooks/usePasswordPolicy'
 import logo from '@/assets/logo.png'
 import miniLogo from '@/assets/mini_logo.png'
 import { HoloApp, HoloModal, HoloButton, HoloInput } from '@/components/holo'
@@ -95,6 +96,7 @@ function ProfileModal({ onClose }: { onClose: () => void }) {
   const [confirmPw, setConfirmPw] = useState('')
   const [pwErr, setPwErr] = useState('')
   const [pwChanged, setPwChanged] = useState(false)
+  const pwMinLength = usePasswordMinLength()
 
   // A missing source predates the field (an older build issued the session) —
   // treat it as local so dev/bootstrap keeps working; only a *known* external
@@ -119,6 +121,9 @@ function ProfileModal({ onClose }: { onClose: () => void }) {
   function submitPasswordChange(e: React.FormEvent) {
     e.preventDefault()
     if (newPw !== confirmPw) { setPwErr('The two passwords do not match'); return }
+    // A mirror of the server rule, so the user is told before the round trip.
+    // The server still enforces it — an unknown minimum just submits.
+    if (tooShort(newPw, pwMinLength)) { setPwErr(passwordTooShortMessage(pwMinLength as number)); return }
     setPwErr('')
     changePw.mutate({ oldPassword: curPw, newPassword: newPw })
   }
@@ -252,7 +257,8 @@ function ProfileModal({ onClose }: { onClose: () => void }) {
               Password changed — please sign in again.
             </div>
             <div style={{ fontSize: 11, color: 'var(--holo-text-faint)', marginTop: 4 }}>
-              Signing you out… every existing session was revoked.
+              Signing you out… every browser session was revoked. API tokens are
+              separate credentials and keep working.
             </div>
           </div>
         ) : (
@@ -266,6 +272,9 @@ function ProfileModal({ onClose }: { onClose: () => void }) {
               <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                 <label htmlFor="new-password" style={{ fontSize: 12, color: 'var(--holo-text-faint)' }}>New password</label>
                 <HoloInput id="new-password" type="password" value={newPw} onChange={e => setNewPw(e.target.value)} required autoComplete="new-password" />
+                {pwMinLength !== undefined && (
+                  <div style={{ fontSize: 11, color: 'var(--holo-text-faint)' }}>At least {pwMinLength} characters</div>
+                )}
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
                 <label htmlFor="new-password-confirm" style={{ fontSize: 12, color: 'var(--holo-text-faint)' }}>Confirm new password</label>
