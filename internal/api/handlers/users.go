@@ -125,6 +125,12 @@ func (h *UserHandler) Delete(c *gin.Context) {
 // (admin) and PUT /api/v1/me/change-password (self). For the self route there is
 // no :userId path param, so it falls back to the acting user from the context.
 func (h *UserHandler) ChangePassword(c *gin.Context) {
+	// The absent :userId is what identifies the self route — the profile
+	// modal — and it decides which verb runs below. Branching on the caller's
+	// role instead sent an admin's own change through SetPassword: the form
+	// asked for the current password and the server threw it away, so a
+	// stolen session could take the account over without knowing it.
+	isSelfRoute := c.Param("userId") == ""
 	username := c.Param("userId")
 	if username == "" {
 		if u, ok := c.Get("username"); ok {
@@ -144,10 +150,13 @@ func (h *UserHandler) ChangePassword(c *gin.Context) {
 	// Admin can set password without old password; self-change requires old password
 	callerRoles, _ := c.Get("roles")
 	isAdmin := hasRole(callerRoles, "nx-admin")
-	callerUsername, _ := c.Get("username")
+	rawCaller, _ := c.Get("username")
+	// A comma-free assertion: authMW always sets this, but a panic here would
+	// answer 500 for what is really a missing-identity bug.
+	caller, _ := rawCaller.(string)
 
 	switch {
-	case !isAdmin && callerUsername.(string) == username:
+	case isSelfRoute, !isAdmin && caller == username:
 		if err := h.svc.ChangePassword(c.Request.Context(), username, req.OldPassword, req.NewPassword); err != nil {
 			if isPasswordManagedExternally(err) {
 				c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})

@@ -96,6 +96,80 @@ func TestUserHandler_SelfChangePassword_OwnPassword_NoContent(t *testing.T) {
 	assert.Equal(t, http.StatusNoContent, rec.Code)
 }
 
+func TestUserHandler_SelfChangePassword_AdminStillNeedsOldPassword(t *testing.T) {
+	// The self route verifies the current password whatever the caller's role.
+	// Branching on the role instead sent an admin's own change through the
+	// no-old-password admin verb, so the "Current password" the profile modal
+	// asks for was accepted with any value — a stolen session (or an unattended
+	// browser) could take the account over without knowing it.
+	r, users := mountSelfChangePassword(t, "admin", []string{"nx-admin"})
+	authSvc := auth.NewService("test-secret-32-chars-long-here!!", 1, 4)
+	hash, err := authSvc.HashPassword("real-old-pw")
+	require.NoError(t, err)
+	require.NoError(t, users.Create(testContext(), &domain.User{
+		Username: "admin", Email: "admin@test.com", PasswordHash: hash,
+		Status: domain.UserStatusActive, Source: domain.UserSourceLocal,
+	}))
+
+	rec := do(t, r, http.MethodPut, "/api/v1/me/change-password", map[string]any{
+		"oldPassword": "wrong-pw",
+		"newPassword": "attacker-chosen-pw",
+	})
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+
+	stored, err := users.Get(testContext(), "admin")
+	require.NoError(t, err)
+	assert.Error(t, authSvc.CheckPassword(stored.PasswordHash, "attacker-chosen-pw"),
+		"a wrong current password must not rewrite the stored hash")
+	assert.NoError(t, authSvc.CheckPassword(stored.PasswordHash, "real-old-pw"))
+}
+
+func TestUserHandler_SelfChangePassword_AdminCorrectOldPassword_NoContent(t *testing.T) {
+	// The flip side: the admin's own change still works with the right password.
+	r, users := mountSelfChangePassword(t, "admin", []string{"nx-admin"})
+	authSvc := auth.NewService("test-secret-32-chars-long-here!!", 1, 4)
+	hash, err := authSvc.HashPassword("real-old-pw")
+	require.NoError(t, err)
+	require.NoError(t, users.Create(testContext(), &domain.User{
+		Username: "admin", Email: "admin@test.com", PasswordHash: hash,
+		Status: domain.UserStatusActive, Source: domain.UserSourceLocal,
+	}))
+
+	rec := do(t, r, http.MethodPut, "/api/v1/me/change-password", map[string]any{
+		"oldPassword": "real-old-pw",
+		"newPassword": "brand-new-pw",
+	})
+	require.Equal(t, http.StatusNoContent, rec.Code)
+
+	stored, err := users.Get(testContext(), "admin")
+	require.NoError(t, err)
+	assert.NoError(t, authSvc.CheckPassword(stored.PasswordHash, "brand-new-pw"))
+}
+
+func TestUserHandler_AdminRoute_ResetsOwnPasswordWithoutOldPassword(t *testing.T) {
+	// The admin route keeps the no-old-password reset, including on the admin's
+	// own account — that is the Users-page reset button, and narrowing the self
+	// route must not take it away.
+	r, users := mountChangePassword(t, "admin", []string{"nx-admin"})
+	authSvc := auth.NewService("test-secret-32-chars-long-here!!", 1, 4)
+	hash, err := authSvc.HashPassword("real-old-pw")
+	require.NoError(t, err)
+	require.NoError(t, users.Create(testContext(), &domain.User{
+		Username: "admin", Email: "admin@test.com", PasswordHash: hash,
+		Status: domain.UserStatusActive, Source: domain.UserSourceLocal,
+	}))
+
+	rec := do(t, r, http.MethodPut,
+		"/service/rest/v1/security/users/admin/change-password", map[string]any{
+			"newPassword": "brand-new-pw",
+		})
+	require.Equal(t, http.StatusNoContent, rec.Code)
+
+	stored, err := users.Get(testContext(), "admin")
+	require.NoError(t, err)
+	assert.NoError(t, authSvc.CheckPassword(stored.PasswordHash, "brand-new-pw"))
+}
+
 func TestUserHandler_SelfChangePassword_CannotTargetOther(t *testing.T) {
 	// The admin route requires the :userId param. A non-admin hitting the admin
 	// route for another user is forbidden (proves self cannot change others).
