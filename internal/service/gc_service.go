@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/robfig/cron/v3"
 	"go.uber.org/zap"
 
 	"github.com/nexspence-oss/nexspence/internal/distlock"
+	"github.com/nexspence-oss/nexspence/internal/domain"
 	"github.com/nexspence-oss/nexspence/internal/logger"
 	"github.com/nexspence-oss/nexspence/internal/repository"
 	"github.com/nexspence-oss/nexspence/internal/storage"
@@ -54,6 +56,11 @@ type BlobGCService struct {
 	DefaultMinAge time.Duration
 }
 
+// ErrGroupStoreNotCompactable is returned by CompactStore for a group blob
+// store: a group holds no blobs of its own, its members are compacted as
+// separate stores (#550).
+var ErrGroupStoreNotCompactable = errors.New("a group blob store holds no blobs; compact its member stores instead")
+
 const gcLockKey = "nexspence:lock:gc:run"
 const gcLockTTL = 30 * time.Minute
 
@@ -73,13 +80,19 @@ func (s *BlobGCService) log() logger.Logger {
 // implicit default) are counted as referenced in every store: they name a key
 // but not a location, and guessing wrong here deletes live data.
 type refIndex struct {
-	byStore map[string]map[string]struct{}
-	anyPos  map[string]struct{}
+	byStore    map[string]map[string]struct{}
+	byPhysical map[string]map[string]struct{}
+	anyPos     map[string]struct{}
 }
 
-func (i refIndex) has(storeID, key string) bool {
+func (i refIndex) has(storeID, physicalID, key string) bool {
 	if _, ok := i.anyPos[key]; ok {
 		return true
+	}
+	if keys, ok := i.byPhysical[physicalID]; ok {
+		if _, ok := keys[key]; ok {
+			return true
+		}
 	}
 	keys, ok := i.byStore[storeID]
 	if !ok {
@@ -89,13 +102,27 @@ func (i refIndex) has(storeID, key string) bool {
 	return ok
 }
 
-// referencedSet indexes every blob key referenced by an asset, by store.
-func (s *BlobGCService) referencedSet(ctx context.Context) (refIndex, error) {
+// referencedSet indexes every blob key referenced by an asset, by logical and
+// physical store. The physical index is required because multiple logical
+// stores may intentionally address one Azure container (for example the
+// seeded "default" and "docker" stores). A reference in either logical store
+// then protects the one physical blob from GC.
+func (s *BlobGCService) referencedSet(ctx context.Context, stores []domain.BlobStore) (refIndex, error) {
 	refs, err := s.Assets.ListAllBlobRefs(ctx)
 	if err != nil {
 		return refIndex{}, fmt.Errorf("list db blob keys: %w", err)
 	}
-	idx := refIndex{byStore: make(map[string]map[string]struct{}), anyPos: make(map[string]struct{})}
+	physicalByID := make(map[string]string, len(stores))
+	for _, store := range stores {
+		physicalByID[store.ID] = storage.PhysicalStoreIdentity(storage.BlobStoreDescriptor{
+			ID: store.ID, Type: store.Type, Config: store.Config,
+		})
+	}
+	idx := refIndex{
+		byStore:    make(map[string]map[string]struct{}),
+		byPhysical: make(map[string]map[string]struct{}),
+		anyPos:     make(map[string]struct{}),
+	}
 	for _, r := range refs {
 		if r.BlobStoreID == "" {
 			idx.anyPos[r.BlobKey] = struct{}{}
@@ -107,19 +134,26 @@ func (s *BlobGCService) referencedSet(ctx context.Context) (refIndex, error) {
 			idx.byStore[r.BlobStoreID] = keys
 		}
 		keys[r.BlobKey] = struct{}{}
+		if physicalID := physicalByID[r.BlobStoreID]; physicalID != "" {
+			physicalKeys, ok := idx.byPhysical[physicalID]
+			if !ok {
+				physicalKeys = make(map[string]struct{})
+				idx.byPhysical[physicalID] = physicalKeys
+			}
+			physicalKeys[r.BlobKey] = struct{}{}
+		}
 	}
 	return idx, nil
 }
 
 // CompactStore compacts a single blob store by name.
 func (s *BlobGCService) CompactStore(ctx context.Context, name string, opts GCOptions) (*GCResult, error) {
-	referenced, err := s.referencedSet(ctx)
-	if err != nil {
-		return nil, err
-	}
 	row, err := s.Stores.Get(ctx, name)
 	if err != nil {
 		return nil, fmt.Errorf("get blob store %q: %w", name, err)
+	}
+	if row.Type == "group" {
+		return nil, fmt.Errorf("blob store %q: %w", name, ErrGroupStoreNotCompactable)
 	}
 	store, err := s.Resolver.Get(ctx, storage.BlobStoreDescriptor{
 		ID: row.ID, Type: row.Type, Config: row.Config,
@@ -127,8 +161,17 @@ func (s *BlobGCService) CompactStore(ctx context.Context, name string, opts GCOp
 	if err != nil {
 		return nil, fmt.Errorf("resolve blob store %q: %w", name, err)
 	}
+	stores, err := s.Stores.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list blob stores for gc references: %w", err)
+	}
+	referenced, err := s.referencedSet(ctx, stores)
+	if err != nil {
+		return nil, err
+	}
 	// A single-store compaction takes no lock, so it has no TTL to outlive.
-	return s.compact(ctx, name, row.ID, store, referenced, opts, time.Time{}), nil
+	physicalID := storage.PhysicalStoreIdentity(storage.BlobStoreDescriptor{ID: row.ID, Type: row.Type, Config: row.Config})
+	return s.compact(ctx, name, row.ID, physicalID, store, referenced, opts, time.Time{}), nil
 }
 
 // CompactAll compacts every blob store. It holds a distributed lock so only one
@@ -154,18 +197,22 @@ func (s *BlobGCService) CompactAll(ctx context.Context, opts GCOptions) ([]*GCRe
 		deadline = time.Now().Add(gcLockTTL)
 	}
 
-	referenced, err := s.referencedSet(ctx)
-	if err != nil {
-		return nil, err
-	}
 	rows, err := s.Stores.List(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("blob gc: list stores: %w", err)
+	}
+	referenced, err := s.referencedSet(ctx, rows)
+	if err != nil {
+		return nil, err
 	}
 
 	results := make([]*GCResult, 0, len(rows))
 	for i := range rows {
 		row := rows[i]
+		if row.Type == "group" {
+			// Its members are rows of their own and get compacted there (#550).
+			continue
+		}
 		store, rerr := s.Resolver.Get(ctx, storage.BlobStoreDescriptor{
 			ID: row.ID, Type: row.Type, Config: row.Config,
 		})
@@ -178,7 +225,8 @@ func (s *BlobGCService) CompactAll(ctx context.Context, opts GCOptions) ([]*GCRe
 			})
 			continue
 		}
-		results = append(results, s.compact(ctx, row.Name, row.ID, store, referenced, opts, deadline))
+		physicalID := storage.PhysicalStoreIdentity(storage.BlobStoreDescriptor{ID: row.ID, Type: row.Type, Config: row.Config})
+		results = append(results, s.compact(ctx, row.Name, row.ID, physicalID, store, referenced, opts, deadline))
 	}
 	return results, nil
 }
@@ -186,7 +234,7 @@ func (s *BlobGCService) CompactAll(ctx context.Context, opts GCOptions) ([]*GCRe
 // compact runs the core scan/delete for a single resolved store. deadline is
 // when the run's distributed lock expires; a zero deadline means no lock is
 // held and the pass runs to the end.
-func (s *BlobGCService) compact(ctx context.Context, name, storeID string, store storage.BlobStore,
+func (s *BlobGCService) compact(ctx context.Context, name, storeID, physicalID string, store storage.BlobStore,
 	referenced refIndex, opts GCOptions, deadline time.Time) *GCResult {
 	minAge := opts.MinAge
 	if minAge <= 0 {
@@ -210,8 +258,16 @@ func (s *BlobGCService) compact(ctx context.Context, name, storeID string, store
 			result.Aborted = true
 			break
 		}
-		if referenced.has(storeID, e.Key) {
+		if referenced.has(storeID, physicalID, e.Key) {
 			continue // still referenced in this store
+		}
+		// Scheduled backups (spec 37) are written straight to the store with
+		// no asset row of their own by design — that's what makes them
+		// invisible to GC's own retention/rotation, not a leak. Without this
+		// skip, every backup archive ages into an "orphan" and GC deletes it
+		// out from under backup_settings.retention_count (#490 review).
+		if strings.HasPrefix(e.Key, backupKeyPrefix) {
+			continue
 		}
 		// Age gate: skip blobs younger than the grace period (may be an
 		// in-flight upload whose asset row is not committed yet).

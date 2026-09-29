@@ -78,6 +78,72 @@ func TestProxyApt_RealShape(t *testing.T) {
 	assert.Equal(t, "deb-bytes", fetchOK(t, "/repository/apt-real/pool/main/h/hello/hello_2.10-3_amd64.deb"))
 }
 
+// ── alpine (dl-cdn.alpinelinux.org shape) ────────────────────────
+
+func TestProxyAlpine_RealShape(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/x86_64/APKINDEX.tar.gz":
+			w.Header().Set("Content-Type", "application/gzip")
+			fmt.Fprint(w, "apkindex-bytes")
+		case "/x86_64/curl-8.9.0-r0.apk":
+			fmt.Fprint(w, "apk-bytes")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer up.Close()
+	createProxyRepo(t, "alpine", "alpine-real", up.URL)
+
+	assert.Contains(t, fetchOK(t, "/repository/alpine-real/x86_64/APKINDEX.tar.gz"), "apkindex-bytes")
+	assert.Equal(t, "apk-bytes", fetchOK(t, "/repository/alpine-real/x86_64/curl-8.9.0-r0.apk"))
+}
+
+// ── huggingface (huggingface.co shape) ───────────────────────────
+
+func TestProxyHuggingFace_RealShape(t *testing.T) {
+	const commit = "1dbc166cf8765166998eff31ade2eb64c8a40076"
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/models/bert-base-uncased":
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"id":"bert-base-uncased","sha":"`+commit+`","siblings":[{"rfilename":"config.json"}]}`)
+		case "/bert-base-uncased/resolve/main/config.json":
+			// The two headers huggingface_hub refuses to download without.
+			w.Header().Set("ETag", `"real-etag"`)
+			w.Header().Set("X-Repo-Commit", commit)
+			fmt.Fprint(w, "config-bytes")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer up.Close()
+	createProxyRepo(t, "huggingface", "hf-real", up.URL)
+
+	assert.Contains(t, fetchOK(t, "/repository/hf-real/api/models/bert-base-uncased"), `"rfilename":"config.json"`)
+	assert.Equal(t, "config-bytes", fetchOK(t, "/repository/hf-real/bert-base-uncased/resolve/main/config.json"))
+}
+
+// ── cran (cran.r-project.org shape) ──────────────────────────────
+
+func TestProxyCRAN_RealShape(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/src/contrib/PACKAGES":
+			fmt.Fprint(w, "Package: dplyr\nVersion: 1.1.4\n")
+		case "/src/contrib/dplyr_1.1.4.tar.gz":
+			fmt.Fprint(w, "cran-bytes")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer up.Close()
+	createProxyRepo(t, "cran", "cran-real", up.URL)
+
+	assert.Contains(t, fetchOK(t, "/repository/cran-real/src/contrib/PACKAGES"), "Package: dplyr")
+	assert.Equal(t, "cran-bytes", fetchOK(t, "/repository/cran-real/src/contrib/dplyr_1.1.4.tar.gz"))
+}
+
 // ── yum (EPEL shape) ─────────────────────────────────────────────
 
 func TestProxyYum_RealShape(t *testing.T) {

@@ -25,13 +25,16 @@ import (
 	"github.com/nexspence-oss/nexspence/internal/distlock"
 	"github.com/nexspence-oss/nexspence/internal/domain"
 	"github.com/nexspence-oss/nexspence/internal/formats"
+	"github.com/nexspence-oss/nexspence/internal/formats/alpine"
 	"github.com/nexspence-oss/nexspence/internal/formats/apt"
 	"github.com/nexspence-oss/nexspence/internal/formats/cargo"
 	"github.com/nexspence-oss/nexspence/internal/formats/conan"
 	"github.com/nexspence-oss/nexspence/internal/formats/conda"
+	"github.com/nexspence-oss/nexspence/internal/formats/cran"
 	"github.com/nexspence-oss/nexspence/internal/formats/gomod"
 	"github.com/nexspence-oss/nexspence/internal/formats/group"
 	"github.com/nexspence-oss/nexspence/internal/formats/helm"
+	"github.com/nexspence-oss/nexspence/internal/formats/huggingface"
 	"github.com/nexspence-oss/nexspence/internal/formats/maven"
 	"github.com/nexspence-oss/nexspence/internal/formats/npm"
 	"github.com/nexspence-oss/nexspence/internal/formats/nuget"
@@ -100,6 +103,7 @@ func NewRouter(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, log 
 	componentRepo := postgres.NewComponentRepo(pool)
 	assetRepo := postgres.NewAssetRepo(pool)
 	cleanupRepo := postgres.NewCleanupPolicyRepo(pool)
+	backupSettingsRepo := postgres.NewBackupSettingsRepo(pool)
 	auditRepo := postgres.NewAuditRepo(pool)
 	userTokenRepo := postgres.NewUserTokenRepo(pool)
 	webhookRepo := postgres.NewWebhookRepo(pool)
@@ -120,7 +124,7 @@ func NewRouter(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, log 
 		cfg.Auth.JWTSecret,
 		cfg.Auth.JWTExpiryHours,
 		cfg.Auth.BcryptCost,
-	)
+	).WithMinPasswordLength(cfg.Auth.PasswordMinLength)
 
 	localBlob, err := storage.NewBlobStoreFromConfig(context.Background(), cfg)
 	if err != nil {
@@ -157,6 +161,22 @@ func NewRouter(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, log 
 		}
 		oidcSealer = sealer
 		userSvc.WithOIDC(oidcSvc, cfg.OIDC)
+		// Google Workspace never puts groups in the id_token; when the Admin
+		// SDK lookup is on, the directory answer feeds role sync instead. A
+		// bad service-account key is a startup error, same as a bad issuer.
+		if g := cfg.OIDC.GoogleAdminSDK; g.Enabled {
+			dir, gErr := auth.NewGoogleDirectory(auth.GoogleDirectoryConfig{
+				ServiceAccountKey:     g.ServiceAccountKey,
+				ServiceAccountKeyFile: g.ServiceAccountKeyFile,
+				SubjectEmail:          g.SubjectEmail,
+			})
+			if gErr != nil {
+				log.Error("oidc google admin sdk init failed", "err", gErr)
+				os.Exit(1)
+			}
+			userSvc.WithGroupLookup(dir)
+			log.Info("oidc group lookup via Google Admin SDK enabled", "subject", g.SubjectEmail)
+		}
 	}
 
 	// SAML is optional; fails startup if IdP metadata is unreachable or misconfigured.
@@ -209,6 +229,16 @@ func NewRouter(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, log 
 		panic("promotion service init: " + err.Error())
 	}
 	promotionSvc.WithWebhooks(webhookSvc)
+	// Auto-promotion on publish (#542): uploads record into the queue through
+	// formatDeps.Publishes below, and a worker on every replica drains it —
+	// rows are leased with SKIP LOCKED, so replicas never work the same one.
+	promotionSvc.WithAutoPromotion(postgres.NewAutoPromotionQueueRepo(pool), auditRepo, log,
+		service.AutoPromotionOptions{
+			SettleWindow: cfg.Promotion.AutoSettleWindow,
+			ScanWait:     cfg.Promotion.AutoScanWait,
+			PollInterval: cfg.Promotion.AutoPollInterval,
+		})
+	safego.Go(log, "auto-promotion-worker", func() { promotionSvc.RunAutoPromotion(ctx) })
 
 	// Debounced download counter: in-memory aggregation, periodic batched flush.
 	dlCounter := service.NewDownloadCounter(assetRepo, log)
@@ -224,6 +254,7 @@ func NewRouter(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, log 
 	// every handler keeps a nil copy of it.
 	scanSvc := service.NewScanService(componentRepo, cfg.HTTP.BaseURL).
 		WithScanResults(scanRepo).
+		WithScanCompleted(promotionSvc.NotifyScanned).
 		WithCredentials(cfg.Bootstrap.AdminUsername, cfg.Bootstrap.AdminPassword).
 		WithTrivy(service.TrivyOptions{
 			Enabled:          cfg.Scan.Trivy.Enabled,
@@ -249,6 +280,10 @@ func NewRouter(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, log 
 		scanTrigger = scanSvc
 		safego.Go(log, "scan-cron-scheduler", func() { scanSvc.StartScheduler(ctx, cfg.Scan.Schedule) })
 	}
+	// A rule waiting for a scan re-asks for it only when automatic scanning is
+	// on (it has a queue to go to); whether a format can be scanned at all is
+	// answered either way.
+	promotionSvc.WithAutoPromotionScanner(scanSvc, cfg.Scan.Enabled)
 
 	formatDeps := formats.Deps{
 		Repos:        repoRepo,
@@ -263,29 +298,36 @@ func NewRouter(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, log 
 		RoutingRules: rrRepo,
 		RBAC:         rbacSvc,
 		Scanner:      scanTrigger,
+		Publishes:    promotionSvc,
 		// Conan's login handshake hands the client a token it then sends as
 		// Bearer, so it has to be the same JWT OptionalAuth validates.
 		Tokens: authSvc,
 		// /v2/ upload paths are exempt from the global body cap, so this is the
 		// only bound on a staged blob upload (issue #208).
 		MaxUploadBytes: cfg.Docker.MaxUploadBytes,
+		// A Helm proxy looks the origin of every uncached chart up in the
+		// upstream index; this is how long a fetched index answers that.
+		HelmIndexCacheTTL: cfg.Helm.IndexCacheTTL,
 	}
 	formatRegistry := map[string]formats.FormatHandler{
-		"raw":       raw.New(formatDeps),
-		"maven2":    maven.New(formatDeps),
-		"npm":       npm.New(formatDeps),
-		"pypi":      pypi.New(formatDeps),
-		"go":        gomod.New(formatDeps),
-		"helm":      helm.New(formatDeps),
-		"nuget":     nuget.New(formatDeps),
-		"cargo":     cargo.New(formatDeps),
-		"conan":     conan.New(formatDeps),
-		"conda":     conda.New(formatDeps),
-		"apt":       apt.New(formatDeps),
-		"terraform": terraform.New(formatDeps),
-		"rubygems":  rubygems.New(formatDeps),
-		"yum":       yum.New(formatDeps),
-		"docker":    oci.New(formatDeps),
+		"raw":         raw.New(formatDeps),
+		"maven2":      maven.New(formatDeps),
+		"npm":         npm.New(formatDeps),
+		"pypi":        pypi.New(formatDeps),
+		"go":          gomod.New(formatDeps),
+		"helm":        helm.New(formatDeps),
+		"nuget":       nuget.New(formatDeps),
+		"cargo":       cargo.New(formatDeps),
+		"conan":       conan.New(formatDeps),
+		"conda":       conda.New(formatDeps),
+		"apt":         apt.New(formatDeps),
+		"terraform":   terraform.New(formatDeps),
+		"rubygems":    rubygems.New(formatDeps),
+		"cran":        cran.New(formatDeps),
+		"yum":         yum.New(formatDeps),
+		"docker":      oci.New(formatDeps),
+		"alpine":      alpine.New(formatDeps),
+		"huggingface": huggingface.New(formatDeps),
 	}
 	// The OCI Distribution protocol is served under two labels — same handler,
 	// different presentation (proxy defaults, UI, command hints).
@@ -316,7 +358,7 @@ func NewRouter(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, log 
 	accessGraphH := handlers.NewAccessGraphHandler(userRepo, roleRepo, privilegeRepo, csRepo)
 	rrSvc := service.NewRoutingRuleService(rrRepo)
 	rrH := handlers.NewRoutingRuleHandler(rrSvc)
-	systemH := handlers.NewSystemHandler(cfg, pool, ldapSvc, oidcSvc).WithBlobStores(blobRepo).WithSAML(samlSvc).WithLogger(log)
+	systemH := handlers.NewSystemHandler(cfg, pool, ldapSvc, oidcSvc).WithBlobStores(blobRepo).WithSAML(samlSvc).WithLogger(log).WithVersion(version)
 	nexusMigSvc := service.NewNexusMigrationService(service.NexusMigrationConfig{
 		Jobs:          migrationRepo,
 		Repos:         repoSvc,
@@ -355,7 +397,10 @@ func NewRouter(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, log 
 		Components: componentRepo,
 		Assets:     assetRepo,
 		BlobStore:  localBlob,
+		Resolver:   blobRegistry,
 	}
+	backupSvc.WithSettings(backupSettingsRepo).WithLocker(locker).WithLogger(log).WithAudit(auditRepo)
+	safego.Go(log, "backup-scheduler", func() { backupSvc.StartScheduler(ctx) })
 	backupH := handlers.NewBackupHandler(backupSvc)
 	rbacMW := handlers.RBACMiddleware(rbacSvc, repoRepo)
 
@@ -528,11 +573,6 @@ func NewRouter(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, log 
 		publicRead.GET("/service/rest/v1/search/assets", componentH.SearchAssets)
 		publicRead.GET("/service/rest/v1/search/assets/download", componentH.SearchAssetsDownload)
 
-		// ── Metrics (authenticated) ───────────────────────────
-		authed.GET("/api/v1/metrics", handlers.MetricsHandler(pool))
-		authed.GET("/api/v1/metrics/history", handlers.HistoryHandler())
-		authed.GET("/api/v1/metrics/repos", handlers.ReposHandler(pool))
-
 		// ── API tokens (current user) ─────────────────────────
 		authed.GET("/api/v1/tokens", tokenH.List)
 		authed.POST("/api/v1/tokens", tokenH.Create)
@@ -554,23 +594,6 @@ func NewRouter(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, log 
 		// ── Cleanup policies (read) ───────────────────────────
 		authed.GET("/service/rest/v1/cleanup-policies", cleanupH.List)
 		authed.GET("/service/rest/v1/cleanup-policies/:id", cleanupH.Get)
-
-		// ── Roles (read) ──────────────────────────────────────
-		authed.GET("/service/rest/v1/security/roles", roleH.List)
-
-		// ── Privileges (read) ─────────────────────────────────
-		authed.GET("/service/rest/v1/security/privileges", privH.List)
-		authed.GET("/service/rest/v1/security/privileges/:id", privH.Get)
-		authed.GET("/service/rest/v1/security/roles/:id/privileges", privH.ListRolePrivileges)
-		authed.GET("/api/v1/security/privilege-role-map", privH.RoleMap)
-
-		// ── Content Selectors (read) ──────────────────────────
-		authed.GET("/service/rest/v1/security/content-selectors", csH.List)
-		authed.GET("/service/rest/v1/security/content-selectors/:id", csH.Get)
-
-		// ── Replication rules (read) ──────────────────────────
-		authed.GET("/api/v1/replication/rules", replH.List)
-		authed.GET("/api/v1/replication/rules/:id/history", replH.ListHistory)
 
 		// ── Promotion (authed) ──────────────────────────────────────
 		authed.GET("/api/v1/promotion/rules", promotionH.ListRules)
@@ -625,19 +648,32 @@ func NewRouter(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, log 
 		admin.POST("/service/rest/v1/cleanup-policies/:id/run", cleanupH.Run)
 		admin.POST("/api/v1/cleanup-policies/:id/preview", cleanupH.Preview)
 
-		// ── Roles (write) ─────────────────────────────────────
+		// ── Roles (read + write) ───────────────────────────────
+		// List moved here from `authed`: no non-admin frontend caller needs the
+		// role catalog (only SecurityPage/UsersPage, both admin-only pages) —
+		// pentest 2026-09-18 found any authenticated user could read it.
+		admin.GET("/service/rest/v1/security/roles", roleH.List)
 		admin.POST("/service/rest/v1/security/roles", roleH.Create)
 		admin.PUT("/service/rest/v1/security/roles/:id", roleH.Update)
 		admin.DELETE("/service/rest/v1/security/roles/:id", roleH.Delete)
 		admin.PUT("/service/rest/v1/security/users/:userId/roles", roleH.SetUserRoles)
 
-		// ── Privileges (write) ────────────────────────────────
+		// ── Privileges (read + write) ──────────────────────────
+		// Reads moved here from `authed` for the same reason as Roles above —
+		// same pentest finding, same "only SecurityPage" usage.
+		admin.GET("/service/rest/v1/security/privileges", privH.List)
+		admin.GET("/service/rest/v1/security/privileges/:id", privH.Get)
+		admin.GET("/service/rest/v1/security/roles/:id/privileges", privH.ListRolePrivileges)
+		admin.GET("/api/v1/security/privilege-role-map", privH.RoleMap)
 		admin.POST("/service/rest/v1/security/privileges", privH.Create)
 		admin.PUT("/service/rest/v1/security/privileges/:id", privH.Update)
 		admin.DELETE("/service/rest/v1/security/privileges/:id", privH.Delete)
 		admin.PUT("/service/rest/v1/security/roles/:id/privileges", privH.SetRolePrivileges)
 
-		// ── Content Selectors (write) ─────────────────────────
+		// ── Content Selectors (read + write) ───────────────────
+		// Reads moved here from `authed`: only SecurityPage calls them.
+		admin.GET("/service/rest/v1/security/content-selectors", csH.List)
+		admin.GET("/service/rest/v1/security/content-selectors/:id", csH.Get)
 		admin.POST("/service/rest/v1/security/content-selectors", csH.Create)
 		admin.PUT("/service/rest/v1/security/content-selectors/:id", csH.Update)
 		admin.DELETE("/service/rest/v1/security/content-selectors/:id", csH.Delete)
@@ -655,7 +691,12 @@ func NewRouter(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, log 
 		admin.DELETE("/api/v1/webhooks/:id", webhookH.Delete)
 		admin.POST("/api/v1/webhooks/:id/test", webhookH.Test)
 
-		// ── Replication rules (write) ─────────────────────────
+		// ── Replication rules (read + write) ──────────────────
+		// Reads moved here from `authed` — pentest 2026-09-18 (F2): only
+		// AdminPage calls listReplicationRules/history, no non-admin need,
+		// and target rules can name internal remote registries.
+		admin.GET("/api/v1/replication/rules", replH.List)
+		admin.GET("/api/v1/replication/rules/:id/history", replH.ListHistory)
 		admin.POST("/api/v1/replication/rules", replH.Create)
 		admin.PUT("/api/v1/replication/rules/:id", replH.Update)
 		admin.DELETE("/api/v1/replication/rules/:id", replH.Delete)
@@ -682,6 +723,12 @@ func NewRouter(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, log 
 		admin.GET("/api/v1/security/scanner", scanH.ScannerStatus)
 
 		// ── System ────────────────────────────────────────────
+		// Metrics moved here from `authed` — pentest 2026-09-18 (F3): the
+		// JSON dashboard metrics are only rendered inside MonitoringPage,
+		// nested under the /admin route; no non-admin caller exists.
+		admin.GET("/api/v1/metrics", handlers.MetricsHandler(pool))
+		admin.GET("/api/v1/metrics/history", handlers.HistoryHandler())
+		admin.GET("/api/v1/metrics/repos", handlers.ReposHandler(pool, log))
 		admin.GET("/service/rest/v1/tasks", tasksH.List)
 		admin.POST("/service/rest/v1/tasks/:id/run", tasksH.Run)
 		admin.GET("/service/rest/v1/security/ldap", ldapH.NexusList)
@@ -708,18 +755,15 @@ func NewRouter(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, log 
 		// ── Backup / Restore (full system) ───────────────────────
 		admin.GET("/api/v1/backup/export", backupH.Export)
 		admin.POST("/api/v1/backup/restore", backupH.Restore)
+		admin.GET("/api/v1/backup/settings", backupH.Settings)
+		admin.PUT("/api/v1/backup/settings", backupH.UpdateSettings)
 
 		// ── Per-repository Export / Import ───────────────────────
 		admin.GET("/api/v1/repositories/:name/export", backupH.ExportRepo)
 		admin.POST("/api/v1/repositories/import", backupH.ImportRepo)
 
 		// System info + service health
-		admin.GET("/api/v1/system/info", func(c *gin.Context) {
-			c.JSON(http.StatusOK, gin.H{
-				"version": version,
-				"product": "Nexspence",
-			})
-		})
+		admin.GET("/api/v1/system/info", systemH.Info)
 		admin.GET("/api/v1/system/services", systemH.Services)
 	}
 

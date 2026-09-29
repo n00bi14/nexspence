@@ -236,6 +236,8 @@ components:
         migratePrivileges:   { type: boolean }
         migrateRoles:        { type: boolean }
         migrateRoutingRules: { type: boolean }
+        userRealms:          { type: array, items: { type: string }, description: "Source realms user migration pulls from. Empty means local-only." }
+        repositories:        { type: array, items: { type: string }, description: "Source repository names to migrate. Empty means every repository." }
         repositoriesTotal:   { type: integer }
         repositoriesDone:    { type: integer }
         assetsTotal:         { type: integer }
@@ -300,6 +302,35 @@ paths:
       responses:
         '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/User' } } } }
         '401': { description: Unauthorized }
+
+  /api/v1/me/change-password:
+    put:
+      tags: [Auth]
+      summary: Change your own password
+      description: >
+        Self-service change for the authenticated user. `oldPassword` is always
+        verified, whatever the caller's role — the admin reset that skips it
+        lives on the `{userId}` route below. Only local accounts have a password
+        here: ldap/oidc/saml credentials belong to the identity provider and are
+        refused with 403. A successful change bumps the JWT cutoff, so every
+        existing browser session (including the caller's) stops working;
+        `nxs_*` API tokens are separate credentials and keep working.
+      operationId: changeMyPassword
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [oldPassword, newPassword]
+              properties:
+                oldPassword: { type: string }
+                newPassword: { type: string, description: 'At least `auth.password_min_length` characters' }
+      responses:
+        '204': { description: Changed }
+        '400': { description: Wrong current password, or the new one is below auth.password_min_length }
+        '401': { description: Unauthorized }
+        '403': { description: The account's password is managed by an identity provider }
 
   # ── Metrics (Nexspence-native) ───────────────────────────────────
 
@@ -650,17 +681,30 @@ paths:
   /service/rest/v1/security/users/{userId}/change-password:
     put:
       tags: [Security]
-      summary: Change user password
+      summary: Reset a user's password (admin)
+      description: >
+        Admin reset: no `oldPassword` is required. Only local accounts can be
+        reset — ldap/oidc/saml credentials belong to the identity provider and
+        are refused with 403. The reset bumps the target's JWT cutoff, ending
+        their existing browser sessions. Users changing their own password use
+        `/api/v1/me/change-password`, which always verifies the current one.
       operationId: changePassword
       parameters:
         - { name: userId, in: path, required: true, schema: { type: string } }
       requestBody:
         required: true
         content:
-          text/plain:
-            schema: { type: string }
+          application/json:
+            schema:
+              type: object
+              required: [newPassword]
+              properties:
+                newPassword: { type: string, description: 'At least `auth.password_min_length` characters' }
       responses:
         '204': { description: Changed }
+        '400': { description: The new password is below auth.password_min_length }
+        '403': { description: The account's password is managed by an identity provider }
+        '404': { description: No such user }
 
   # ── Security — Roles ─────────────────────────────────────────
 
@@ -752,6 +796,17 @@ paths:
         - { name: name, in: path, required: true, schema: { type: string } }
       responses:
         '204': { description: Deleted }
+        '409':
+          description: >
+            The blob store is still in use — as a group member, as a
+            repository's blob_store_id, or by remaining assets. The error
+            body names what blocks deletion and what to do about it.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string }
 
   /service/rest/v1/blobstores/{name}/quota-status:
     get:
@@ -868,6 +923,43 @@ paths:
                 forcePathStyle:   { type: boolean }
       responses:
         '204': { description: Created }
+
+  /service/rest/v1/blobstores/azure:
+    post:
+      tags: [BlobStores]
+      summary: Create Azure Blob Storage blob store
+      description: >
+        Native extension beyond the Nexus surface. Exactly one credential path is
+        required: accountKey (with accountName), connectionString, sasToken, or the
+        host's Entra ID identity (send no credential at all). The container must
+        already exist. Credentials are never returned by a read; responses carry
+        `<key>_set: true` markers instead, and an update that omits a credential
+        keeps the stored one.
+      operationId: createAzureBlobStore
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, config]
+              properties:
+                name: { type: string }
+                quotaBytes: { type: integer, nullable: true }
+                config:
+                  type: object
+                  required: [container]
+                  properties:
+                    container:         { type: string, description: "Existing blob container" }
+                    account_name:      { type: string }
+                    account_key:       { type: string, description: "Shared key; enables presigned URLs" }
+                    connection_string: { type: string, description: "Wins over account_name/account_key/sas_token" }
+                    sas_token:         { type: string, description: "Pre-generated SAS; presigned URLs unavailable" }
+                    endpoint:          { type: string, description: "Custom endpoint (Azurite, sovereign cloud)" }
+                    skip_tls_verify:   { type: boolean }
+      responses:
+        '201': { description: Created }
+        '400': { description: Invalid config or unreachable container }
 
   # ── Cleanup Policies ─────────────────────────────────────────
 
@@ -1111,9 +1203,17 @@ paths:
         by its own scope flag and runs in this order:
 
         1. Repositories — hosted, then proxy, then group, so a group's members
-           exist before the group naming them.
-        2. Artifacts — hosted repositories only; a proxy re-fetches from its own
-           upstream, so its cache is not copied. For a registry repository
+           exist before the group naming them. `scope.repositories` limits this
+           stage to the named source repositories; omitted or empty means all.
+           The Admin UI requires a tested connection before Repositories or
+           Artifacts can start, so an operator cannot accidentally omit the
+           list. A group in the list also migrates its members — a group
+           cannot be created empty, and artifacts live on the hosted and proxy
+           members.
+        2. Artifacts — hosted repositories and proxy caches; independent of the
+           Repositories flag. When Repositories is off, artifacts copy into
+           hosted or proxy destinations that already exist here. A proxy cache
+           is copied rather than re-fetched from upstream. For a registry repository
            (docker/oci) the blobs are read out of each manifest rather than out
            of the component listing, which reports only the manifest and names
            blobs under a placeholder image; blobs are stored before the manifest
@@ -1160,6 +1260,8 @@ paths:
                     migratePrivileges:   { type: boolean }
                     migrateRoles:        { type: boolean }
                     migrateRoutingRules: { type: boolean }
+                    userRealms:          { type: array, items: { type: string } }
+                    repositories:        { type: array, items: { type: string }, description: "Source names. Empty or omitted means every repository." }
       responses:
         '201':
           description: Job created and started

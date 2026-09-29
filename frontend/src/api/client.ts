@@ -32,13 +32,19 @@ apiClient.interceptors.request.use((config) => {
   return config
 })
 
-// Redirect to login on 401, but NOT when the 401 comes from the login endpoint itself
-// (otherwise the error never reaches the form and "nothing happens").
+// A 401 means "sign in" only when the request carried a token that the server
+// refused — the session expired or was revoked — so clear it and go to /login.
+// A signed-out visitor browsing public repositories (#404) has no session to
+// lose: a 401 there is just a resource they cannot read, and bouncing them to
+// the login wall would undo the anonymous UI. NOT when the 401 comes from the
+// login endpoint itself (otherwise the error never reaches the form and
+// "nothing happens").
 apiClient.interceptors.response.use(
   (r) => r,
   (err) => {
     const url: string = err.config?.url ?? ''
-    if (err.response?.status === 401 && !url.endsWith('/login')) {
+    const presentedToken = Boolean(err.config?.headers?.Authorization)
+    if (err.response?.status === 401 && presentedToken && !url.endsWith('/login')) {
       localStorage.removeItem('nexspence_token')
       window.location.href = '/login'
     }
@@ -61,6 +67,9 @@ export interface AuthConfig {
   samlIdpMetadataUrl?: string
   samlProvisioning?: string
   samlMetadataUrl?: string
+  // auth.password_min_length, mirrored by the password forms. Optional: a
+  // server predating the field omits it, and 0 means the setting is unwired.
+  passwordMinLength?: number
 }
 
 export interface ServiceStatus {
@@ -93,13 +102,56 @@ export interface CleanupPreviewResponse {
   totalBytes: number
 }
 
-export interface ImportRepoStats {
+// Mirrors service.RestoreFailure: one archived item that was not brought back.
+export interface RestoreFailure {
+  kind: string
+  name: string
+  error: string
+}
+
+// Mirrors service.FailureReport. failures is capped server-side; failedItems
+// counts them all.
+export interface FailureReport {
+  failedItems?: number
+  failures?: RestoreFailure[]
+}
+
+export interface ImportRepoStats extends FailureReport {
   repository: string
   components: number
   assets: number
   blobs: number
+  blobsFailed: number
   conflictMode: string
 }
+
+// Mirrors service.RestoreStats.
+export interface RestoreStats extends FailureReport {
+  blobStores: number
+  repositories: number
+  users: number
+  roles: number
+  cleanupPolicies: number
+  components: number
+  assets: number
+  blobs: number
+  blobsFailed: number
+}
+
+// Mirrors domain.BackupSettings (internal/domain/types.go).
+export interface BackupSettings {
+  enabled: boolean
+  scheduleCron: string
+  blobStoreId?: string
+  retentionCount: number
+  lastRunAt?: string
+  lastRunKey?: string
+  lastRunError?: string
+  updatedAt?: string
+}
+
+// PUT body: only the editable fields — LastRun* is server-owned.
+export type BackupSettingsInput = Pick<BackupSettings, 'enabled' | 'scheduleCron' | 'blobStoreId' | 'retentionCount'>
 
 export interface BlobStoreMigration {
   id: string;
@@ -254,12 +306,19 @@ export const nexusApi = {
     apiClient.put(`/service/rest/v1/security/users/${userId}`, data),
   deleteUser: (userId: string) =>
     apiClient.delete(`/service/rest/v1/security/users/${userId}`),
-  changePassword: (userId: string, password: string) =>
+  // The backend binds {oldPassword, newPassword} as JSON. oldPassword is
+  // omitted on the admin path (resetting another user's password), where the
+  // handler does not ask for it; the self path (/api/v1/me/change-password)
+  // requires it.
+  changePassword: (userId: string, newPassword: string, oldPassword?: string) =>
     apiClient.put(
-      `/service/rest/v1/security/users/${userId}/change-password`,
-      password,
-      { headers: { 'Content-Type': 'text/plain' } },
+      `/service/rest/v1/security/users/${encodeURIComponent(userId)}/change-password`,
+      { oldPassword, newPassword },
     ),
+  // Self-service change (avatar → Profile): always sends the current password;
+  // the route derives the target user from the session, no :userId.
+  changeMyPassword: (oldPassword: string, newPassword: string) =>
+    apiClient.put('/api/v1/me/change-password', { oldPassword, newPassword }),
 
   // Roles
   listRoles: () => apiClient.get('/service/rest/v1/security/roles'),
@@ -415,8 +474,13 @@ export const nexspenceApi = {
   restoreBackup: (file: File) => {
     const fd = new FormData()
     fd.append('file', file)
-    return apiClient.post<{ restored: Record<string, number> }>('/api/v1/backup/restore', fd)
+    return apiClient.post<{ restored: RestoreStats }>('/api/v1/backup/restore', fd)
   },
+
+  // Scheduled backup config — see handlers/backup.go Settings/UpdateSettings
+  getBackupSettings: () => apiClient.get<BackupSettings>('/api/v1/backup/settings'),
+  updateBackupSettings: (settings: BackupSettingsInput) =>
+    apiClient.put<void>('/api/v1/backup/settings', settings),
 
   exportRepo: (name: string) =>
     apiClient.get(`/api/v1/repositories/${encodeURIComponent(name)}/export`, { responseType: 'blob' }),

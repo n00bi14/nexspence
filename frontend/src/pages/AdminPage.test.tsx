@@ -32,7 +32,13 @@ describe('AdminPage — Info tab', () => {
   it('renders status, system info and service connections', async () => {
     server.use(
       http.get('/service/rest/v1/status', () => HttpResponse.json({ status: 'ok', edition: 'OSS', version: '1.9.0' })),
-      http.get('/api/v1/system/info', () => HttpResponse.json({ version: '1.9.0', product: 'Nexspence' })),
+      http.get('/api/v1/system/info', () =>
+        HttpResponse.json({
+          version: '1.9.0',
+          product: 'Nexspence',
+          storage: { default_type: 'local', local: { base_path: './data/blobs' } },
+        }),
+      ),
       http.get('/api/v1/system/services', () =>
         HttpResponse.json([
           { name: 'PostgreSQL', status: 'ok', latency_ms: 12, detail: 'connected', checked_at: new Date().toISOString() },
@@ -47,6 +53,20 @@ describe('AdminPage — Info tab', () => {
     expect(await screen.findByText('PostgreSQL')).toBeInTheDocument()
     expect(screen.getByText('S3 Storage')).toBeInTheDocument()
     expect(screen.getAllByText('Docker Subdomain Connector').length).toBeGreaterThan(0)
+  })
+
+  it('states the check time once and survives a status without one', async () => {
+    server.use(
+      http.get('/api/v1/system/services', () =>
+        HttpResponse.json([
+          { name: 'PostgreSQL', status: 'ok', latency_ms: 12, detail: 'connected', checked_at: '2026-09-22T08:31:52Z' },
+          { name: 'Docker Subdomain Connector', status: 'ok', detail: 'Active *.docker.example.com', checked_at: '' },
+        ]),
+      ),
+    )
+    renderAdmin('info')
+    expect(await screen.findByText(/^Checked /)).toBeInTheDocument()
+    expect(screen.queryByText(/Invalid Date/)).not.toBeInTheDocument()
   })
 
   it('shows offline status and disabled docker connector', async () => {
@@ -279,6 +299,27 @@ describe('AdminPage — Blob Stores tab', () => {
     await waitFor(() => expect(deleted).toBe(true))
   })
 
+  it('detail modal: shows the 409 delete error from the API', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    server.use(
+      http.get('/service/rest/v1/blobstores', () => HttpResponse.json([blobStore])),
+      http.get('/api/v1/blob-stores/:name/usage', () =>
+        HttpResponse.json({ store: blobStore, linkedRepositories: [], totalAssetBytes: 0 }),
+      ),
+      http.delete('/service/rest/v1/blobstores/:name', () =>
+        HttpResponse.json(
+          { error: 'blob store "default" still holds 3 assets — migrate those artifacts to another store or delete them first' },
+          { status: 409 },
+        ),
+      ),
+    )
+    renderAdmin('blobs')
+    fireEvent.click(await screen.findByText('default'))
+    await screen.findByText('Blob Store: default')
+    fireEvent.click(await screen.findByRole('button', { name: /Delete/ }))
+    expect(await screen.findByRole('alert')).toHaveTextContent(/still holds 3 assets/)
+  })
+
   it('detail modal: shows group members for group type', async () => {
     const group = { ...blobStore, type: 'group', config: { fill_policy: 'round_robin' } }
     server.use(
@@ -321,6 +362,32 @@ describe('AdminPage — Blob Stores tab', () => {
     expect(posted!.name).toBe('newstore')
   })
 
+  it('create modal: local path follows server base path and name until edited', async () => {
+    const user = userEvent.setup()
+    server.use(
+      http.get('/service/rest/v1/blobstores', () => HttpResponse.json([])),
+      http.get('/api/v1/system/info', () =>
+        HttpResponse.json({
+          version: '1.9.0',
+          product: 'Nexspence',
+          storage: { default_type: 'local', local: { base_path: '/blobs' } },
+        }),
+      ),
+    )
+    renderAdmin('blobs')
+    await screen.findByText('No blob stores configured')
+    await user.click(screen.getAllByRole('button', { name: /New Blob Store/ })[0])
+    await screen.findByRole('heading', { name: 'New Blob Store' })
+    expect(await screen.findByDisplayValue('/blobs/')).toBeInTheDocument()
+    expect(screen.getByText(/This server stores blobs under \/blobs/)).toBeInTheDocument()
+    await user.type(screen.getByPlaceholderText('e.g. fast-ssd'), 'fast-ssd')
+    expect(screen.getByDisplayValue('/blobs/fast-ssd')).toBeInTheDocument()
+    fireEvent.change(screen.getByDisplayValue('/blobs/fast-ssd'), { target: { value: '/mnt/other' } })
+    await user.type(screen.getByPlaceholderText('e.g. fast-ssd'), '2')
+    expect(screen.getByDisplayValue('/mnt/other')).toBeInTheDocument()
+    expect(screen.queryByDisplayValue('/blobs/fast-ssd2')).not.toBeInTheDocument()
+  })
+
   it('create modal: test connection for local store', async () => {
     const user = userEvent.setup()
     server.use(
@@ -359,6 +426,174 @@ describe('AdminPage — Blob Stores tab', () => {
     await user.click(await screen.findByText('Group'))
     expect(await screen.findByText(/Fill Policy/)).toBeInTheDocument()
     expect(screen.getByText(/Members \(non-group/)).toBeInTheDocument()
+  })
+
+  it('detail modal: names the stored azure credential from the _set markers', async () => {
+    const az = {
+      ...blobStore,
+      type: 'azure',
+      config: { container: 'nx-oci', account_name: 'mystorage', account_key_set: true },
+    }
+    server.use(
+      http.get('/service/rest/v1/blobstores', () => HttpResponse.json([az])),
+      http.get('/api/v1/blob-stores/:name/usage', () =>
+        HttpResponse.json({ store: az, linkedRepositories: [], totalAssetBytes: 0 }),
+      ),
+    )
+    renderAdmin('blobs')
+    fireEvent.click(await screen.findByText('default'))
+    await screen.findByText('Blob Store: default')
+    expect(await screen.findByText('Credential')).toBeInTheDocument()
+    expect(screen.getByText('Account key')).toBeInTheDocument()
+  })
+
+  it('detail modal: an azure store with no credential reads as Entra ID', async () => {
+    const az = { ...blobStore, type: 'azure', config: { container: 'nx-oci', account_name: 'mystorage' } }
+    server.use(
+      http.get('/service/rest/v1/blobstores', () => HttpResponse.json([az])),
+      http.get('/api/v1/blob-stores/:name/usage', () =>
+        HttpResponse.json({ store: az, linkedRepositories: [], totalAssetBytes: 0 }),
+      ),
+    )
+    renderAdmin('blobs')
+    fireEvent.click(await screen.findByText('default'))
+    await screen.findByText('Blob Store: default')
+    expect(await screen.findByText('Entra ID identity')).toBeInTheDocument()
+  })
+
+  it('detail modal: edit form marks which azure credentials are stored', async () => {
+    const az = {
+      ...blobStore,
+      type: 'azure',
+      config: { container: 'nx-oci', account_name: 'mystorage', sas_token_set: true },
+    }
+    server.use(
+      http.get('/service/rest/v1/blobstores', () => HttpResponse.json([az])),
+      http.get('/api/v1/blob-stores/:name/usage', () =>
+        HttpResponse.json({ store: az, linkedRepositories: [], totalAssetBytes: 0 }),
+      ),
+    )
+    renderAdmin('blobs')
+    fireEvent.click(await screen.findByText('default'))
+    await screen.findByText('Blob Store: default')
+    fireEvent.click(await screen.findByRole('button', { name: /Edit Config/i }))
+    await screen.findByText('Edit Configuration')
+    expect(await screen.findByText(/SAS token \(stored — leave blank to keep\)/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'SAS token' })).toBeInTheDocument()
+  })
+
+  it('azure edit: keeps an unchanged credential but clears the other modes explicitly', async () => {
+    const az = {
+      ...blobStore,
+      type: 'azure',
+      config: { container: 'nx-oci', account_name: 'mystorage', account_key_set: true },
+    }
+    let put: { config?: Record<string, unknown> } | null = null
+    server.use(
+      http.get('/service/rest/v1/blobstores', () => HttpResponse.json([az])),
+      http.get('/api/v1/blob-stores/:name/usage', () =>
+        HttpResponse.json({ store: az, linkedRepositories: [], totalAssetBytes: 0 }),
+      ),
+      http.put('/service/rest/v1/blobstores/:type/:name', async ({ request }) => {
+        put = (await request.json()) as { config?: Record<string, unknown> }
+        return HttpResponse.json(az)
+      }),
+    )
+    renderAdmin('blobs')
+    fireEvent.click(await screen.findByText('default'))
+    await screen.findByRole('button', { name: /Edit Config/i })
+    fireEvent.click(screen.getByRole('button', { name: /Edit Config/i }))
+    await screen.findByText('Edit Configuration')
+    fireEvent.click(screen.getByRole('button', { name: 'Account key' }))
+    expect(await screen.findByText('Entra ID identity')).toBeInTheDocument()
+    fireEvent.click(screen.getByText('Entra ID identity'))
+    fireEvent.click(screen.getByRole('button', { name: /^Save$/ }))
+    await waitFor(() => expect(put).toBeTruthy())
+    expect(put!.config?.account_key).toBe('')
+    expect(put!.config?.connection_string).toBe('')
+    expect(put!.config?.sas_token).toBe('')
+  })
+
+  it('azure edit: switching authentication sends the new credential and removes the old one', async () => {
+    const user = userEvent.setup()
+    const az = {
+      ...blobStore,
+      type: 'azure',
+      config: { container: 'nx-oci', account_name: 'mystorage', account_key_set: true },
+    }
+    let put: { config?: Record<string, unknown> } | null = null
+    server.use(
+      http.get('/service/rest/v1/blobstores', () => HttpResponse.json([az])),
+      http.get('/api/v1/blob-stores/:name/usage', () =>
+        HttpResponse.json({ store: az, linkedRepositories: [], totalAssetBytes: 0 }),
+      ),
+      http.put('/service/rest/v1/blobstores/:type/:name', async ({ request }) => {
+        put = (await request.json()) as { config?: Record<string, unknown> }
+        return HttpResponse.json(az)
+      }),
+    )
+    renderAdmin('blobs')
+    fireEvent.click(await screen.findByText('default'))
+    fireEvent.click(await screen.findByRole('button', { name: /Edit Config/i }))
+    await screen.findByText('Edit Configuration')
+    fireEvent.click(screen.getByRole('button', { name: 'Account key' }))
+    await user.click(await screen.findByText('Connection string'))
+    await user.type(screen.getByPlaceholderText('not set'), 'new-connection-string')
+    await user.click(screen.getByRole('button', { name: /^Save$/ }))
+    await waitFor(() => expect(put).toBeTruthy())
+    expect(put!.config?.account_key).toBe('')
+    expect(put!.config?.connection_string).toBe('new-connection-string')
+    expect(put!.config?.sas_token).toBe('')
+  })
+
+  it('create modal: switches to azure type showing azure fields', async () => {
+    const user = userEvent.setup()
+    server.use(http.get('/service/rest/v1/blobstores', () => HttpResponse.json([])))
+    renderAdmin('blobs')
+    await screen.findByText('No blob stores configured')
+    await user.click(screen.getAllByRole('button', { name: /New Blob Store/ })[0])
+    await screen.findByRole('heading', { name: 'New Blob Store' })
+    await user.click(screen.getByRole('button', { name: /Local filesystem/ }))
+    await user.click(await screen.findByText('Azure Blob Storage'))
+    expect(await screen.findByText('Container')).toBeInTheDocument()
+    expect(screen.getByText(/Account name/)).toBeInTheDocument()
+  })
+
+  it('create modal: azure test button stays disabled without a container', async () => {
+    const user = userEvent.setup()
+    server.use(http.get('/service/rest/v1/blobstores', () => HttpResponse.json([])))
+    renderAdmin('blobs')
+    await screen.findByText('No blob stores configured')
+    await user.click(screen.getAllByRole('button', { name: /New Blob Store/ })[0])
+    await user.type(screen.getByPlaceholderText('e.g. fast-ssd'), 'azstore')
+    await user.click(screen.getByRole('button', { name: /Local filesystem/ }))
+    await user.click(await screen.findByText('Azure Blob Storage'))
+    await screen.findByText('Container')
+    expect(screen.getByRole('button', { name: /Test Connection/ })).toBeDisabled()
+    await user.type(screen.getByPlaceholderText('must already exist'), 'nx-oci')
+    expect(screen.getByRole('button', { name: /Test Connection/ })).toBeEnabled()
+  })
+
+  it('create modal: azure payload carries the container', async () => {
+    const user = userEvent.setup()
+    let posted: { name: string; config?: Record<string, unknown> } | null = null
+    server.use(
+      http.get('/service/rest/v1/blobstores', () => HttpResponse.json([])),
+      http.post('/service/rest/v1/blobstores/:type', async ({ request }) => {
+        posted = (await request.json()) as { name: string; config?: Record<string, unknown> }
+        return HttpResponse.json({}, { status: 201 })
+      }),
+    )
+    renderAdmin('blobs')
+    await screen.findByText('No blob stores configured')
+    await user.click(screen.getAllByRole('button', { name: /New Blob Store/ })[0])
+    await user.type(screen.getByPlaceholderText('e.g. fast-ssd'), 'azstore')
+    await user.click(screen.getByRole('button', { name: /Local filesystem/ }))
+    await user.click(await screen.findByText('Azure Blob Storage'))
+    await user.type(screen.getByPlaceholderText('must already exist'), 'nx-oci')
+    await user.click(screen.getByRole('button', { name: /^Create$/ }))
+    await waitFor(() => expect(posted).toBeTruthy())
+    expect(posted!.config?.container).toBe('nx-oci')
   })
 })
 
@@ -436,6 +671,175 @@ describe('AdminPage — Backup tab', () => {
     // clear the chosen file
     fireEvent.click(screen.getByTitle('Clear'))
     await waitFor(() => expect(screen.queryByText('repo.tar.gz')).not.toBeInTheDocument())
+  })
+
+  const backupStores = [
+    { id: 'bs-backups', name: 'backups', type: 's3', usedBytes: 0 },
+    { id: 'bs-group', name: 'grp', type: 'group', usedBytes: 0 },
+  ]
+
+  it('loads scheduled backup settings and lists only non-group stores', async () => {
+    server.use(
+      http.get('/service/rest/v1/blobstores', () => HttpResponse.json(backupStores)),
+      http.get('/api/v1/backup/settings', () =>
+        HttpResponse.json({ enabled: true, scheduleCron: '0 4 * * *', blobStoreId: 'bs-backups', retentionCount: 3 }),
+      ),
+    )
+    renderAdmin('backup')
+    expect(await screen.findByDisplayValue('0 4 * * *')).toBeInTheDocument()
+    expect(screen.getByLabelText('Enabled')).toBeChecked()
+    expect(screen.getByDisplayValue('backups (s3)')).toBeInTheDocument()
+    expect(screen.getByRole('spinbutton')).toHaveValue(3)
+    expect(screen.queryByRole('option', { name: 'grp (group)' })).not.toBeInTheDocument()
+  })
+
+  it('saves scheduled backup settings with the edited values', async () => {
+    const user = userEvent.setup()
+    let body: unknown
+    server.use(
+      http.get('/service/rest/v1/blobstores', () => HttpResponse.json(backupStores)),
+      http.put('/api/v1/backup/settings', async ({ request }) => {
+        body = await request.json()
+        return new HttpResponse(null, { status: 204 })
+      }),
+    )
+    renderAdmin('backup')
+    await screen.findByText('Scheduled Backup')
+    await user.click(screen.getByLabelText('Enabled'))
+    const cron = screen.getByDisplayValue('0 3 * * *')
+    await user.clear(cron)
+    await user.type(cron, '0 1 * * *')
+    await screen.findByRole('option', { name: 'backups (s3)' })
+    await user.selectOptions(screen.getByDisplayValue('Select a blob store…'), 'bs-backups')
+    const keep = screen.getByRole('spinbutton')
+    await user.clear(keep)
+    await user.type(keep, '2')
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    expect(await screen.findByText('Saved')).toBeInTheDocument()
+    expect(body).toEqual({ enabled: true, scheduleCron: '0 1 * * *', blobStoreId: 'bs-backups', retentionCount: 2 })
+  })
+
+  it('will not save an enabled schedule without a destination store', async () => {
+    const user = userEvent.setup()
+    renderAdmin('backup')
+    await screen.findByText('Scheduled Backup')
+    await user.click(screen.getByLabelText('Enabled'))
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
+    expect(screen.getByText('Pick a destination blob store to enable scheduling.')).toBeInTheDocument()
+  })
+
+  it('shows the server error when saving is rejected', async () => {
+    const user = userEvent.setup()
+    server.use(
+      http.get('/service/rest/v1/blobstores', () => HttpResponse.json(backupStores)),
+      http.put('/api/v1/backup/settings', () =>
+        HttpResponse.json({ error: 'invalid scheduleCron "* * * *"' }, { status: 400 }),
+      ),
+    )
+    renderAdmin('backup')
+    await screen.findByText('Scheduled Backup')
+    await screen.findByRole('option', { name: 'backups (s3)' })
+    await user.selectOptions(screen.getByDisplayValue('Select a blob store…'), 'bs-backups')
+    await user.click(screen.getByRole('button', { name: 'Save' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('invalid scheduleCron "* * * *"')
+    expect(screen.queryByText('Saved')).not.toBeInTheDocument()
+  })
+
+  it('will not save an emptied "Keep last N" as keep-all', async () => {
+    const user = userEvent.setup()
+    server.use(
+      http.get('/api/v1/backup/settings', () => HttpResponse.json({ enabled: false, scheduleCron: '0 3 * * *', retentionCount: 3 })),
+    )
+    renderAdmin('backup')
+    // Wait for the loaded settings, or they would overwrite the edit below.
+    await waitFor(() => expect(screen.getByRole('spinbutton')).toHaveValue(3))
+    await user.clear(screen.getByRole('spinbutton'))
+    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled()
+    expect(screen.getByText('Enter how many backups to keep — 0 keeps all of them.')).toBeInTheDocument()
+    await user.type(screen.getByRole('spinbutton'), '0')
+    expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled()
+  })
+
+  it('does not call a restore that dropped blobs complete', async () => {
+    server.use(
+      http.post('/api/v1/backup/restore', () => HttpResponse.json({ restored: { repositories: 1, blobs: 2, blobsFailed: 3 } })),
+    )
+    renderAdmin('backup')
+    await screen.findByText('System Backup & Restore')
+    const fileInput = document.querySelector('input[type="file"][accept=".tar.gz,.tgz"]') as HTMLInputElement
+    fireEvent.change(fileInput, { target: { files: [new File(['x'], 'b.tar.gz')] } })
+    expect(await screen.findByText(/Restore finished with errors/)).toBeInTheDocument()
+    expect(screen.queryByText('Restore complete')).not.toBeInTheDocument()
+  })
+
+  it('says which imported blobs could not be written', async () => {
+    const user = userEvent.setup()
+    server.use(
+      http.post('/api/v1/repositories/import', () =>
+        HttpResponse.json({ imported: { repository: 'r', components: 1, assets: 0, blobs: 0, blobsFailed: 4, conflictMode: 'skip' } }),
+      ),
+    )
+    renderAdmin('backup')
+    await screen.findByText('Repository Import')
+    const importInput = document.querySelectorAll('input[type="file"][accept=".tar.gz,.tgz"]')[1] as HTMLInputElement
+    fireEvent.change(importInput, { target: { files: [new File(['x'], 'repo.tar.gz')] } })
+    await screen.findByText('repo.tar.gz')
+    await user.click(screen.getByRole('button', { name: /Import Repository/ }))
+    expect(await screen.findByText(/4 blobs could not be written/)).toBeInTheDocument()
+  })
+
+  it('lists what a restore could not bring back', async () => {
+    server.use(
+      http.post('/api/v1/backup/restore', () => HttpResponse.json({
+        restored: {
+          repositories: 0, assets: 5, blobsFailed: 0, failedItems: 102,
+          failures: [{ kind: 'repository', name: 'raw-s3', error: 'pq: insert violates foreign key constraint' }],
+        },
+      })),
+    )
+    renderAdmin('backup')
+    await screen.findByText('System Backup & Restore')
+    const fileInput = document.querySelector('input[type="file"][accept=".tar.gz,.tgz"]') as HTMLInputElement
+    fireEvent.change(fileInput, { target: { files: [new File(['x'], 'b.tar.gz')] } })
+    expect(await screen.findByText(/Restore finished with errors — 102 items could not be restored/)).toBeInTheDocument()
+    expect(screen.queryByText('Restore complete')).not.toBeInTheDocument()
+    expect(screen.getByText('raw-s3')).toBeInTheDocument()
+    expect(screen.getByText(/foreign key constraint/)).toBeInTheDocument()
+    expect(screen.getByText(/101 more/)).toBeInTheDocument()
+  })
+
+  it('lists what an import could not bring back', async () => {
+    const user = userEvent.setup()
+    server.use(
+      http.post('/api/v1/repositories/import', () =>
+        HttpResponse.json({ imported: {
+          repository: 'r', components: 1, assets: 0, blobs: 0, blobsFailed: 0, conflictMode: 'skip',
+          failedItems: 1, failures: [{ kind: 'asset', name: 'r/a.bin', error: 'pq: connection reset' }],
+        } }),
+      ),
+    )
+    renderAdmin('backup')
+    await screen.findByText('Repository Import')
+    const importInput = document.querySelectorAll('input[type="file"][accept=".tar.gz,.tgz"]')[1] as HTMLInputElement
+    fireEvent.change(importInput, { target: { files: [new File(['x'], 'repo.tar.gz')] } })
+    await screen.findByText('repo.tar.gz')
+    await user.click(screen.getByRole('button', { name: /Import Repository/ }))
+    expect(await screen.findByText('Import finished with errors')).toBeInTheDocument()
+    expect(screen.queryByText('Import complete')).not.toBeInTheDocument()
+    expect(screen.getByText('r/a.bin')).toBeInTheDocument()
+  })
+
+  it('shows the last scheduled run and its failure', async () => {
+    server.use(
+      http.get('/api/v1/backup/settings', () =>
+        HttpResponse.json({
+          enabled: true, scheduleCron: '0 3 * * *', retentionCount: 7,
+          lastRunAt: '2026-09-24T03:00:00Z', lastRunError: 'destination blob store was deleted',
+        }),
+      ),
+    )
+    renderAdmin('backup')
+    expect(await screen.findByText(/failed: destination blob store was deleted/)).toBeInTheDocument()
   })
 })
 
@@ -796,6 +1200,206 @@ describe('AdminPage — Promotion tab', () => {
     await user.click(delBtns[delBtns.length - 1])
     await waitFor(() => expect(deleted).toBe(true))
   })
+
+  // #543: the severities that fail require_scan_pass are chosen per rule.
+  describe('scan fail severities', () => {
+    type RulePayload = { require_scan_pass: boolean; scan_fail_severities: string[] }
+    const reposHandler = http.get('/service/rest/v1/repositories', () =>
+      HttpResponse.json([fixtures.repository({ name: 'maven-hosted' }), fixtures.repository({ id: 'r2', name: 'maven-release' })]),
+    )
+    const sevBox = (name: string) => screen.getByRole('checkbox', { name })
+
+    const openCreate = async (user: ReturnType<typeof userEvent.setup>) => {
+      renderAdmin('promotion')
+      await screen.findByText('No promotion rules configured')
+      await user.click(screen.getByRole('button', { name: /Create Rule/ }))
+      await screen.findByText('Create Promotion Rule')
+      await user.type(screen.getByPlaceholderText('promote-to-release'), 'new-rule')
+      await user.click(screen.getByRole('button', { name: /Select source repository/ }))
+      await user.click((await screen.findAllByText('maven-hosted'))[0])
+      await user.click(screen.getByRole('button', { name: /Select target repository/ }))
+      await user.click((await screen.findAllByText('maven-release'))[0])
+    }
+
+    it('defaults to malicious/critical/high and posts the chosen set', async () => {
+      const user = userEvent.setup()
+      let posted: RulePayload | null = null
+      server.use(
+        http.get('/api/v1/promotion/rules', () => HttpResponse.json([])),
+        http.get('/api/v1/promotion/requests', () => HttpResponse.json([])),
+        reposHandler,
+        http.post('/api/v1/promotion/rules', async ({ request }) => {
+          posted = (await request.json()) as RulePayload
+          return HttpResponse.json(promRule, { status: 201 })
+        }),
+      )
+      await openCreate(user)
+      expect(screen.queryByText('FAIL ON SEVERITIES')).not.toBeInTheDocument()
+      await user.click(screen.getByRole('checkbox', { name: /Require scan pass/ }))
+      expect(screen.getByText('FAIL ON SEVERITIES')).toBeInTheDocument()
+      expect(sevBox('MALICIOUS')).toBeChecked()
+      expect(sevBox('CRITICAL')).toBeChecked()
+      expect(sevBox('HIGH')).toBeChecked()
+      expect(sevBox('MEDIUM')).not.toBeChecked()
+      expect(sevBox('LOW')).not.toBeChecked()
+      expect(sevBox('UNKNOWN')).not.toBeChecked()
+
+      await user.click(sevBox('HIGH'))
+      await user.click(sevBox('MEDIUM'))
+      await user.click(screen.getByRole('button', { name: /^Create$/ }))
+      await waitFor(() => expect(posted).toBeTruthy())
+      expect(posted!.require_scan_pass).toBe(true)
+      expect(posted!.scan_fail_severities).toEqual(['malicious', 'critical', 'medium'])
+    })
+
+    it('refuses to save with no severity selected', async () => {
+      const user = userEvent.setup()
+      let posted = false
+      server.use(
+        http.get('/api/v1/promotion/rules', () => HttpResponse.json([])),
+        http.get('/api/v1/promotion/requests', () => HttpResponse.json([])),
+        reposHandler,
+        http.post('/api/v1/promotion/rules', () => { posted = true; return HttpResponse.json(promRule, { status: 201 }) }),
+      )
+      await openCreate(user)
+      await user.click(screen.getByRole('checkbox', { name: /Require scan pass/ }))
+      for (const sev of ['MALICIOUS', 'CRITICAL', 'HIGH']) await user.click(sevBox(sev))
+      await user.click(screen.getByRole('button', { name: /^Create$/ }))
+      expect(await screen.findByText('Select at least one severity that fails the scan')).toBeInTheDocument()
+      expect(posted).toBe(false)
+    })
+
+    it('sends an empty list when the scan gate is off', async () => {
+      const user = userEvent.setup()
+      let posted: RulePayload | null = null
+      server.use(
+        http.get('/api/v1/promotion/rules', () => HttpResponse.json([])),
+        http.get('/api/v1/promotion/requests', () => HttpResponse.json([])),
+        reposHandler,
+        http.post('/api/v1/promotion/rules', async ({ request }) => {
+          posted = (await request.json()) as RulePayload
+          return HttpResponse.json(promRule, { status: 201 })
+        }),
+      )
+      await openCreate(user)
+      await user.click(screen.getByRole('button', { name: /^Create$/ }))
+      await waitFor(() => expect(posted).toBeTruthy())
+      expect(posted!.require_scan_pass).toBe(false)
+      expect(posted!.scan_fail_severities).toEqual([])
+    })
+
+    it('round-trips a rule\'s own severities through edit', async () => {
+      const user = userEvent.setup()
+      let put: RulePayload | null = null
+      const custom = { ...promRule, scan_fail_severities: ['critical', 'low'] }
+      server.use(
+        http.get('/api/v1/promotion/rules', () => HttpResponse.json([custom])),
+        http.get('/api/v1/promotion/requests', () => HttpResponse.json([])),
+        reposHandler,
+        http.put('/api/v1/promotion/rules/:id', async ({ request }) => {
+          put = (await request.json()) as RulePayload
+          return HttpResponse.json(custom)
+        }),
+      )
+      renderAdmin('promotion')
+      await screen.findByText('to-release')
+      expect(screen.getByText('Scan Pass')).toHaveAttribute('title', 'Fails on: critical, low')
+      await user.click(screen.getByRole('button', { name: /Edit/ }))
+      await screen.findByText('Edit — to-release')
+      expect(sevBox('MALICIOUS')).not.toBeChecked()
+      expect(sevBox('CRITICAL')).toBeChecked()
+      expect(sevBox('HIGH')).not.toBeChecked()
+      expect(sevBox('LOW')).toBeChecked()
+      await user.click(screen.getByRole('button', { name: /^Save$/ }))
+      await waitFor(() => expect(put).toBeTruthy())
+      expect(put!.scan_fail_severities).toEqual(['critical', 'low'])
+    })
+
+    it('shows the default set for a rule without its own list', async () => {
+      const user = userEvent.setup()
+      server.use(
+        http.get('/api/v1/promotion/rules', () => HttpResponse.json([promRule])),
+        http.get('/api/v1/promotion/requests', () => HttpResponse.json([])),
+        reposHandler,
+      )
+      renderAdmin('promotion')
+      await screen.findByText('to-release')
+      expect(screen.getByText('Scan Pass')).toHaveAttribute('title', 'Fails on: malicious, critical, high')
+      await user.click(screen.getByRole('button', { name: /Edit/ }))
+      await screen.findByText('Edit — to-release')
+      expect(sevBox('MALICIOUS')).toBeChecked()
+      expect(sevBox('CRITICAL')).toBeChecked()
+      expect(sevBox('HIGH')).toBeChecked()
+      expect(sevBox('MEDIUM')).not.toBeChecked()
+    })
+  })
+
+  // #542: a rule can start by itself on publish.
+  describe('automatic promotion', () => {
+    type RulePayload = { auto_promote: boolean }
+    const reposHandler = http.get('/service/rest/v1/repositories', () =>
+      HttpResponse.json([fixtures.repository({ name: 'maven-hosted' }), fixtures.repository({ id: 'r2', name: 'maven-release' })]),
+    )
+    const autoBox = () => screen.getByRole('checkbox', { name: /Promote automatically on publish/ })
+
+    it('is off by default and posts the choice', async () => {
+      const user = userEvent.setup()
+      let posted: RulePayload | null = null
+      server.use(
+        http.get('/api/v1/promotion/rules', () => HttpResponse.json([])),
+        http.get('/api/v1/promotion/requests', () => HttpResponse.json([])),
+        reposHandler,
+        http.post('/api/v1/promotion/rules', async ({ request }) => {
+          posted = (await request.json()) as RulePayload
+          return HttpResponse.json(promRule, { status: 201 })
+        }),
+      )
+      renderAdmin('promotion')
+      await screen.findByText('No promotion rules configured')
+      await user.click(screen.getByRole('button', { name: /Create Rule/ }))
+      await screen.findByText('Create Promotion Rule')
+      await user.type(screen.getByPlaceholderText('promote-to-release'), 'auto-rule')
+      await user.click(screen.getByRole('button', { name: /Select source repository/ }))
+      await user.click((await screen.findAllByText('maven-hosted'))[0])
+      await user.click(screen.getByRole('button', { name: /Select target repository/ }))
+      await user.click((await screen.findAllByText('maven-release'))[0])
+      expect(autoBox()).not.toBeChecked()
+      expect(screen.getByText(/starts this rule by itself/)).toBeInTheDocument()
+      await user.click(autoBox())
+      await user.click(screen.getByRole('button', { name: /^Create$/ }))
+      await waitFor(() => expect(posted).toBeTruthy())
+      expect(posted!.auto_promote).toBe(true)
+    })
+
+    it('badges an automatic rule, keeps the flag through edit, and marks automatic requests', async () => {
+      const user = userEvent.setup()
+      let put: RulePayload | null = null
+      const autoRule = { ...promRule, auto_promote: true }
+      const autoReq = {
+        ...promReq, id: 'req-2', status: 'failed', automatic: true, requested_by: '',
+        error: 'automatic promotion blocked: scan has 1 high findings',
+      }
+      server.use(
+        http.get('/api/v1/promotion/rules', () => HttpResponse.json([autoRule])),
+        http.get('/api/v1/promotion/requests', () => HttpResponse.json([autoReq])),
+        reposHandler,
+        http.put('/api/v1/promotion/rules/:id', async ({ request }) => {
+          put = (await request.json()) as RulePayload
+          return HttpResponse.json(autoRule)
+        }),
+      )
+      renderAdmin('promotion')
+      expect(await screen.findByText('Auto on Publish')).toBeInTheDocument()
+      expect(await screen.findByText('Auto')).toHaveAttribute('title', 'Filed automatically on publish')
+      expect(screen.getByText('failed')).toHaveAttribute('title', autoReq.error)
+      await user.click(screen.getByRole('button', { name: /Edit/ }))
+      await screen.findByText('Edit — to-release')
+      expect(autoBox()).toBeChecked()
+      await user.click(screen.getByRole('button', { name: /^Save$/ }))
+      await waitFor(() => expect(put).toBeTruthy())
+      expect(put!.auto_promote).toBe(true)
+    })
+  })
 })
 
 describe('AdminPage — Migration tab', () => {
@@ -824,11 +1428,62 @@ describe('AdminPage — Migration tab', () => {
     await waitFor(() => expect(paused).toBe(true))
   })
 
+  it('reveals lastError under the history row that was opened', async () => {
+    const user = userEvent.setup()
+    const historyJob = (over: Record<string, unknown>) => ({
+      sourceUser: 'nexspence',
+      status: 'done',
+      migrateRepos: true,
+      migrateUsers: false,
+      migrateBlobs: true,
+      migratePolicies: false,
+      repositoriesTotal: 1,
+      repositoriesDone: 1,
+      assetsTotal: 10,
+      assetsDone: 10,
+      createdAt: '',
+      updatedAt: new Date().toISOString(),
+      finishedAt: new Date().toISOString(),
+      ...over,
+    })
+    server.use(
+      http.get('/api/v1/migration/jobs', () =>
+        HttpResponse.json([
+          historyJob({ id: 'helm', sourceUrl: 'https://nexus.helm.example', errorCount: 2, lastError: 'repo helm-hosted: asset index.yaml was not planned' }),
+          historyJob({ id: 'raw', sourceUrl: 'https://nexus.raw.example', errorCount: 1, lastError: 'repo raw-hosted: asset orphan.bin was not planned' }),
+        ]),
+      ),
+    )
+    renderAdmin('migration')
+    expect(await screen.findByText('https://nexus.helm.example')).toBeInTheDocument()
+    expect(screen.queryByText(/index.yaml was not planned/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/orphan.bin was not planned/)).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: '2 errors' }))
+    expect(screen.getByText(/index.yaml was not planned/)).toBeInTheDocument()
+    expect(screen.queryByText(/orphan.bin was not planned/)).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: '1 errors' }))
+    expect(screen.getByText(/index.yaml was not planned/)).toBeInTheDocument()
+    expect(screen.getByText(/orphan.bin was not planned/)).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: '2 errors' }))
+    expect(screen.queryByText(/index.yaml was not planned/)).not.toBeInTheDocument()
+    expect(screen.getByText(/orphan.bin was not planned/)).toBeInTheDocument()
+  })
+
   it('creates a migration job through the wizard', async () => {
     const user = userEvent.setup()
     let posted: { sourceUrl: string } | null = null
     server.use(
       http.get('/api/v1/migration/jobs', () => HttpResponse.json([])),
+      http.post('/api/v1/migration/preview', () =>
+        HttpResponse.json({
+          reachable: true,
+          repoCount: 1,
+          repos: [{ name: 'raw-hosted', format: 'raw', type: 'hosted' }],
+        }),
+      ),
       http.post('/api/v1/migration/jobs', async ({ request }) => {
         posted = (await request.json()) as { sourceUrl: string }
         return HttpResponse.json({ id: 'job-1' }, { status: 201 })
@@ -841,14 +1496,149 @@ describe('AdminPage — Migration tab', () => {
     await user.type(screen.getByPlaceholderText('https://nexus.example.com'), 'https://src.com')
     const pwInputs = document.querySelectorAll('input[type="password"]')
     fireEvent.change(pwInputs[0], { target: { value: 'secret' } })
+    await user.click(screen.getByRole('button', { name: /Test connection/ }))
+    expect(await screen.findByText(/1 repository found/)).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: /Next/ }))
     await screen.findByText('Step 2 of 3')
+    await user.click(await screen.findByRole('checkbox', { name: /raw-hosted/ }))
     await user.click(screen.getByRole('button', { name: /Next/ }))
     await screen.findByText('Step 3 of 3')
     const startBtns = screen.getAllByRole('button', { name: /Start Migration/ })
     await user.click(startBtns[startBtns.length - 1])
     await waitFor(() => expect(posted).toBeTruthy())
     expect(posted!.sourceUrl).toBe('https://src.com')
+  })
+
+  it('does not leave the source step until the connection is tested', async () => {
+    const user = userEvent.setup()
+    server.use(http.get('/api/v1/migration/jobs', () => HttpResponse.json([])))
+    renderAdmin('migration')
+    await screen.findByText('No migration jobs yet')
+    await user.click(screen.getByRole('button', { name: /Start Migration/ }))
+    await screen.findByText('Step 1 of 3')
+    await user.type(screen.getByPlaceholderText('https://nexus.example.com'), 'https://src.com')
+    const pwInputs = document.querySelectorAll('input[type="password"]')
+    fireEvent.change(pwInputs[0], { target: { value: 'secret' } })
+    expect(screen.getByRole('button', { name: /Next/ })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /Test connection/ }).querySelector('svg')).toBeNull()
+    expect(screen.getByText('Step 1 of 3')).toBeInTheDocument()
+  })
+
+  it('sends selected repositories after testing the connection', async () => {
+    const user = userEvent.setup()
+    let posted: { scope?: { repositories?: string[] } } | null = null
+    server.use(
+      http.get('/api/v1/migration/jobs', () => HttpResponse.json([])),
+      http.post('/api/v1/migration/preview', () =>
+        HttpResponse.json({
+          reachable: true,
+          repoCount: 2,
+          repos: [
+            { name: 'raw-hosted', format: 'raw', type: 'hosted' },
+            { name: 'maven-central', format: 'maven2', type: 'proxy' },
+          ],
+        }),
+      ),
+      http.post('/api/v1/migration/jobs', async ({ request }) => {
+        posted = (await request.json()) as { scope?: { repositories?: string[] } }
+        return HttpResponse.json({ id: 'job-1' }, { status: 201 })
+      }),
+    )
+    renderAdmin('migration')
+    await screen.findByText('No migration jobs yet')
+    await user.click(screen.getByRole('button', { name: /Start Migration/ }))
+    await screen.findByText('Step 1 of 3')
+    await user.type(screen.getByPlaceholderText('https://nexus.example.com'), 'https://src.com')
+    const pwInputs = document.querySelectorAll('input[type="password"]')
+    fireEvent.change(pwInputs[0], { target: { value: 'secret' } })
+    await user.click(screen.getByRole('button', { name: /Test connection/ }))
+    expect(await screen.findByText(/2 repositories found/)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: /Next/ }))
+    await screen.findByText('Step 2 of 3')
+    await user.click(await screen.findByRole('checkbox', { name: /raw-hosted/ }))
+    await user.click(screen.getByRole('button', { name: /Next/ }))
+    await screen.findByText('Step 3 of 3')
+    const startBtns = screen.getAllByRole('button', { name: /Start Migration/ })
+    await user.click(startBtns[startBtns.length - 1])
+    await waitFor(() => expect(posted).toBeTruthy())
+    expect(posted!.scope!.repositories).toEqual(['raw-hosted'])
+  })
+
+  it('disables groups when only artifacts are in scope', async () => {
+    const user = userEvent.setup()
+    let posted: { scope?: { migrateRepos?: boolean; migrateBlobs?: boolean; repositories?: string[] } } | null = null
+    server.use(
+      http.get('/api/v1/migration/jobs', () => HttpResponse.json([])),
+      http.post('/api/v1/migration/preview', () =>
+        HttpResponse.json({
+          reachable: true,
+          repoCount: 3,
+          repos: [
+            { name: 'raw-hosted', format: 'raw', type: 'hosted' },
+            { name: 'maven-central', format: 'maven2', type: 'proxy' },
+            { name: 'raw-group', format: 'raw', type: 'group' },
+          ],
+        }),
+      ),
+      http.post('/api/v1/migration/jobs', async ({ request }) => {
+        posted = (await request.json()) as { scope?: { migrateRepos?: boolean; migrateBlobs?: boolean; repositories?: string[] } }
+        return HttpResponse.json({ id: 'job-1' }, { status: 201 })
+      }),
+    )
+    renderAdmin('migration')
+    await screen.findByText('No migration jobs yet')
+    await user.click(screen.getByRole('button', { name: /Start Migration/ }))
+    await screen.findByText('Step 1 of 3')
+    await user.type(screen.getByPlaceholderText('https://nexus.example.com'), 'https://src.com')
+    const pwInputs = document.querySelectorAll('input[type="password"]')
+    fireEvent.change(pwInputs[0], { target: { value: 'secret' } })
+    await user.click(screen.getByRole('button', { name: /Test connection/ }))
+    expect(await screen.findByText(/3 repositories found/)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: /Next/ }))
+    await screen.findByText('Step 2 of 3')
+    await user.click(screen.getByRole('checkbox', { name: 'Repositories' }))
+    expect(screen.getByRole('checkbox', { name: /maven-central/ })).toBeEnabled()
+    expect(screen.getByRole('checkbox', { name: /raw-group/ })).toBeDisabled()
+    expect(screen.getByRole('checkbox', { name: /raw-hosted/ })).toBeEnabled()
+    await user.click(screen.getByRole('checkbox', { name: /raw-hosted/ }))
+    await user.click(screen.getByRole('button', { name: /Next/ }))
+    await screen.findByText('Step 3 of 3')
+    const startBtns = screen.getAllByRole('button', { name: /Start Migration/ })
+    await user.click(startBtns[startBtns.length - 1])
+    await waitFor(() => expect(posted).toBeTruthy())
+    expect(posted!.scope).toMatchObject({
+      migrateRepos: false,
+      migrateBlobs: true,
+      repositories: ['raw-hosted'],
+    })
+  })
+
+  it('blocks next when every repository is unchecked after a preview', async () => {
+    const user = userEvent.setup()
+    server.use(
+      http.get('/api/v1/migration/jobs', () => HttpResponse.json([])),
+      http.post('/api/v1/migration/preview', () =>
+        HttpResponse.json({
+          reachable: true,
+          repoCount: 1,
+          repos: [{ name: 'raw-hosted', format: 'raw', type: 'hosted' }],
+        }),
+      ),
+    )
+    renderAdmin('migration')
+    await screen.findByText('No migration jobs yet')
+    await user.click(screen.getByRole('button', { name: /Start Migration/ }))
+    await screen.findByText('Step 1 of 3')
+    await user.type(screen.getByPlaceholderText('https://nexus.example.com'), 'https://src.com')
+    const pwInputs = document.querySelectorAll('input[type="password"]')
+    fireEvent.change(pwInputs[0], { target: { value: 'secret' } })
+    await user.click(screen.getByRole('button', { name: /Test connection/ }))
+    expect(await screen.findByText(/1 repository found/)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: /Next/ }))
+    await screen.findByText('Step 2 of 3')
+    await user.click(screen.getByRole('button', { name: /Next/ }))
+    expect(await screen.findByText(/Select at least one repository/)).toBeInTheDocument()
+    expect(screen.getByText('Step 2 of 3')).toBeInTheDocument()
   })
 
   it('validates the wizard source step', async () => {

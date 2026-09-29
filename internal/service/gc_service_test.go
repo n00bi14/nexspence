@@ -15,9 +15,11 @@ import (
 )
 
 // defaultStoreID is the id testutil.NewBlobStoreRepo seeds the "default" store
-// with. GC now asks "referenced in THIS store?", so a fixture asset has to sit
-// on the store under compaction to count as a reference.
+// with. The GC keeps the logical-store distinction for migrations, while also
+// combining references when multiple rows address one physical namespace.
 const defaultStoreID = "00000000-0000-0000-0000-000000000001"
+
+const sharedAzureDockerStoreID = "00000000-0000-0000-0000-000000000002"
 
 func buildGC(assets *testutil.AssetRepo, bs *testutil.BlobStore) *service.BlobGCService {
 	return &service.BlobGCService{
@@ -110,6 +112,24 @@ func TestGC_OldOrphanCollectedByMinAge(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, result.Orphans)
 	assert.False(t, bs.Has("old"))
+}
+
+func TestGC_ScheduledBackupSurvivesPastMinAge(t *testing.T) {
+	assets := testutil.NewAssetRepo()
+	bs := testutil.NewBlobStore()
+	ctx := context.Background()
+	// "backups/" mirrors backup_scheduled.go's own unexported backupKeyPrefix
+	// — scheduled backups (spec 37) are written with no asset row of their
+	// own by design, so without GC's explicit skip this key would look
+	// exactly like any other orphan once it ages past MinAge.
+	require.NoError(t, bs.Put(ctx, "backups/nexspence-backup-20260918-120000.tar.gz", bytes.NewReader([]byte("archive")), 7))
+	bs.SetMTime("backups/nexspence-backup-20260918-120000.tar.gz", time.Now().Add(-48*time.Hour))
+
+	svc := buildGC(assets, bs)
+	result, err := svc.CompactStore(ctx, "default", service.GCOptions{MinAge: 24 * time.Hour})
+	require.NoError(t, err)
+	assert.Equal(t, 0, result.Orphans, "a scheduled backup must never be collected as an orphan")
+	assert.True(t, bs.Has("backups/nexspence-backup-20260918-120000.tar.gz"))
 }
 
 func TestGC_CompactAllIteratesStores(t *testing.T) {
@@ -279,4 +299,94 @@ func TestGC_AssetWithoutStoreID_ProtectsEveryStore(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 0, result.Orphans)
 	assert.True(t, bs.Has("key1"))
+}
+
+func TestGC_CompactStore_SharedAzureContainer_ProtectsOtherLogicalStore(t *testing.T) {
+	assets := testutil.NewAssetRepo()
+	shared := testutil.NewBlobStore()
+	ctx := context.Background()
+
+	require.NoError(t, shared.Put(ctx, "docker-live", bytes.NewReader([]byte("live")), 4))
+	require.NoError(t, shared.Put(ctx, "orphan", bytes.NewReader([]byte("old")), 3))
+	require.NoError(t, assets.Create(ctx, &domain.Asset{
+		ComponentID: "c1", RepositoryID: "r1", Repository: "docker-repo",
+		Path: "/manifest", BlobKey: "docker-live", BlobStoreID: sharedAzureDockerStoreID, SizeBytes: 4,
+	}))
+
+	stores := testutil.NewBlobStoreRepo(
+		&domain.BlobStore{
+			ID: defaultStoreID, Name: "default", Type: "azure", UsedBytes: 3,
+			Config: map[string]any{
+				"container": "shared", "account_name": "acct",
+				"endpoint": "https://acct.blob.core.windows.net",
+			},
+		},
+		&domain.BlobStore{
+			ID: sharedAzureDockerStoreID, Name: "docker", Type: "azure", UsedBytes: 4,
+			Config: map[string]any{
+				"container": "shared", "account_name": "ignored",
+				"endpoint":          "https://ignored.example",
+				"connection_string": "DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=YQ==;EndpointSuffix=core.windows.net",
+			},
+		},
+	).WithAssets(assets)
+
+	result, err := (&service.BlobGCService{
+		Assets: assets, Stores: stores, Resolver: testutil.NewFakeResolver(shared),
+	}).CompactStore(ctx, "default", service.GCOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, 2, result.ScannedBlobs)
+	assert.Equal(t, 1, result.Orphans)
+	assert.False(t, shared.Has("orphan"))
+	assert.True(t, shared.Has("docker-live"), "a reference in the sibling logical store must protect the shared-container blob")
+
+	defaultStore, err := stores.Get(ctx, "default")
+	require.NoError(t, err)
+	dockerStore, err := stores.Get(ctx, "docker")
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), defaultStore.UsedBytes)
+	assert.Equal(t, int64(4), dockerStore.UsedBytes)
+}
+
+// groupStoreRow is a group blob store over the seeded "default" store. A group
+// holds no blobs of its own, so the registry has no physical store for it.
+func groupStoreRow() *domain.BlobStore {
+	return &domain.BlobStore{
+		ID: "00000000-0000-0000-0000-0000000000a1", Name: "grp", Type: "group",
+		Config: map[string]any{"member_ids": []any{defaultStoreID}},
+	}
+}
+
+func TestGC_CompactAll_SkipsGroupStores(t *testing.T) {
+	ctx := context.Background()
+	bs := testutil.NewBlobStore()
+	stores := testutil.NewBlobStoreRepo(
+		&domain.BlobStore{ID: defaultStoreID, Name: "default", Type: "local"},
+		groupStoreRow(),
+	)
+	svc := &service.BlobGCService{
+		Assets:   testutil.NewAssetRepo(),
+		Stores:   stores,
+		Resolver: testutil.NewFakeResolver(bs),
+	}
+
+	results, err := svc.CompactAll(ctx, service.GCOptions{})
+	require.NoError(t, err)
+	require.Len(t, results, 1, "a group store has no blobs of its own; its members are compacted as their own rows")
+	assert.Equal(t, "default", results[0].Store)
+	assert.Empty(t, results[0].Errors)
+}
+
+func TestGC_CompactStore_GroupStoreIsRejected(t *testing.T) {
+	svc := &service.BlobGCService{
+		Assets: testutil.NewAssetRepo(),
+		Stores: testutil.NewBlobStoreRepo(
+			&domain.BlobStore{ID: defaultStoreID, Name: "default", Type: "local"},
+			groupStoreRow(),
+		),
+		Resolver: testutil.NewFakeResolver(testutil.NewBlobStore()),
+	}
+
+	_, err := svc.CompactStore(context.Background(), "grp", service.GCOptions{})
+	require.ErrorIs(t, err, service.ErrGroupStoreNotCompactable)
 }

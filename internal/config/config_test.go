@@ -193,6 +193,27 @@ func TestLoad_GCDefaults(t *testing.T) {
 	assert.Equal(t, 24*time.Hour, cfg.GC.MinAge)
 }
 
+func TestLoad_PromotionDefaultsAndEnv(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, 30*time.Second, cfg.Promotion.AutoSettleWindow)
+	assert.Equal(t, time.Hour, cfg.Promotion.AutoScanWait)
+	assert.Equal(t, 5*time.Second, cfg.Promotion.AutoPollInterval)
+
+	// The Helm chart sets these by environment variable.
+	t.Setenv("NEXSPENCE_PROMOTION_AUTO_SETTLE_WINDOW", "2m")
+	cfg, err = Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, 2*time.Minute, cfg.Promotion.AutoSettleWindow)
+}
+
 // Automatic scanning is on out of the box: an unscanned upload is the state
 // this feature exists to prevent, so opting in is the wrong default.
 func TestLoad_ScanDefaults(t *testing.T) {
@@ -357,6 +378,44 @@ func TestLoad_DockerMaxUploadBytes_Configurable(t *testing.T) {
 	assert.Equal(t, int64(1048576), cfg.Docker.MaxUploadBytes)
 }
 
+// A Helm proxy resolves the origin of every uncached chart out of the upstream
+// index, so the index is fetched on the download path too. The cache that keeps
+// that from being one download per pull ships on, and an operator who would
+// rather pay the traffic than wait out the window can shorten it or set 0.
+func TestLoad_HelmIndexCacheTTL(t *testing.T) {
+	const base = "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"
+
+	t.Run("default", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(base), 0o600))
+
+		cfg, err := Load(path)
+		require.NoError(t, err)
+		assert.Equal(t, 5*time.Minute, cfg.Helm.IndexCacheTTL)
+	})
+
+	t.Run("from the config file", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(base+"helm:\n  index_cache_ttl: 30s\n"), 0o600))
+
+		cfg, err := Load(path)
+		require.NoError(t, err)
+		assert.Equal(t, 30*time.Second, cfg.Helm.IndexCacheTTL)
+	})
+
+	t.Run("from the environment", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(base), 0o600))
+		t.Setenv("NEXSPENCE_HELM_INDEX_CACHE_TTL", "0s")
+
+		cfg, err := Load(path)
+		require.NoError(t, err)
+		assert.Zero(t, cfg.Helm.IndexCacheTTL, "0 must reach the server as caching off")
+	})
+}
+
 // The bootstrap admin exists so a fresh install has someone to log in as, so
 // it is on by default. Operators who have already created their own accounts
 // turn it off — see TestLoad_BootstrapCanBeDisabled.
@@ -459,4 +518,179 @@ func TestLoad_TrivyFromEnv(t *testing.T) {
 	assert.Equal(t, "/var/cache/trivy", cfg.Scan.Trivy.CacheDir)
 	assert.Equal(t, []string{"mirror1.example.com/trivy-db", "mirror2.example.com/trivy-db"}, cfg.Scan.Trivy.DBRepository,
 		"NEXSPENCE_SCAN_TRIVY_DB_REPOSITORY was not applied")
+}
+
+func TestLoad_RedisPasswordFromEnv(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	t.Setenv("NEXSPENCE_REDIS_ENABLED", "true")
+	t.Setenv("NEXSPENCE_REDIS_ADDR", "nexspence-redis-primary:6379")
+	t.Setenv("NEXSPENCE_REDIS_PASSWORD", "s3cret")
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.True(t, cfg.Redis.Enabled)
+	assert.Equal(t, "nexspence-redis-primary:6379", cfg.Redis.Addr)
+	assert.Equal(t, "s3cret", cfg.Redis.Password)
+}
+
+func TestLoad_AzureStorageFromEnv(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	t.Setenv("NEXSPENCE_STORAGE_DEFAULT_TYPE", "azure")
+	t.Setenv("NEXSPENCE_STORAGE_AZURE_CONTAINER", "nexspence-blobs")
+	t.Setenv("NEXSPENCE_STORAGE_AZURE_ACCOUNT_NAME", "mystorage")
+	t.Setenv("NEXSPENCE_STORAGE_AZURE_ACCOUNT_KEY", "secret-key")
+	t.Setenv("NEXSPENCE_STORAGE_AZURE_ENDPOINT", "https://mystorage.blob.core.windows.net")
+	t.Setenv("NEXSPENCE_STORAGE_AZURE_SKIP_TLS_VERIFY", "true")
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, "azure", cfg.Storage.DefaultType)
+	assert.Equal(t, "nexspence-blobs", cfg.Storage.Azure.Container)
+	assert.Equal(t, "mystorage", cfg.Storage.Azure.AccountName)
+	assert.Equal(t, "secret-key", cfg.Storage.Azure.AccountKey)
+	assert.Equal(t, "https://mystorage.blob.core.windows.net", cfg.Storage.Azure.Endpoint)
+	assert.True(t, cfg.Storage.Azure.SkipTLSVerify)
+}
+
+func TestValidateStorage(t *testing.T) {
+	for _, tc := range []struct {
+		typ     string
+		wantErr bool
+	}{
+		{"", false},
+		{"local", false},
+		{"s3", false},
+		{"azure", false},
+		{"S3", true},
+		{"azue", true},
+		{"gcs", true},
+	} {
+		err := ValidateStorage(StorageConfig{DefaultType: tc.typ})
+		if tc.wantErr {
+			assert.Error(t, err, "default_type %q must be rejected, not silently treated as local", tc.typ)
+			continue
+		}
+		assert.NoError(t, err, "default_type %q must be accepted", tc.typ)
+	}
+}
+
+// Viper splits map keys on "." (its path delimiter). Alias hostnames always
+// contain dots, so without flattening Unmarshal into map[string]string fails
+// even when the YAML key is quoted — the split is after parse, not a YAML issue.
+func TestLoad_DockerSubdomainAliases_DottedHostnames(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n" +
+		"docker:\n" +
+		"  subdomain_connector:\n" +
+		"    enabled: true\n" +
+		"    base_domain: \"nexspence.example.com\"\n" +
+		"    aliases:\n" +
+		"      \"docker-hub-proxy.example.com\": \"dockerhub-proxy\"\n" +
+		"      hub.nexspence.example.com: dockerhub-proxy\n" +
+		"      docker-group.example.com: docker-group\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{
+		"docker-hub-proxy.example.com": "dockerhub-proxy",
+		"hub.nexspence.example.com":    "dockerhub-proxy",
+		"docker-group.example.com":     "docker-group",
+	}, cfg.Docker.SubdomainConnector.Aliases)
+}
+
+// Viper's env lookup treats an empty value as "unset" unless AllowEmptyEnv is
+// on, so NEXSPENCE_OIDC_GROUPS_CLAIM="" used to leave the non-empty default
+// ("groups") in place — the exact opposite of what an operator disabling the
+// claim asked for, with no error to say so (#482).
+func TestLoad_ExplicitEmptyEnvOverridesNonEmptyDefault(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	t.Setenv("NEXSPENCE_OIDC_GROUPS_CLAIM", "")
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, "", cfg.OIDC.GroupsClaim,
+		"an env var set to the empty string is an explicit override, not an absent one")
+}
+
+// The other direction must keep working: an env var that is not set at all
+// leaves the default alone.
+func TestLoad_UnsetEnvKeepsNonEmptyDefault(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	content := "" +
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n" +
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	require.NoError(t, os.Unsetenv("NEXSPENCE_OIDC_GROUPS_CLAIM"))
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.Equal(t, "groups", cfg.OIDC.GroupsClaim)
+}
+
+// ── oidc.google_admin_sdk (#483) ─────────────────────────────────────────────
+
+func TestValidateOIDC_GoogleAdminSDK_DisabledIgnoresFields(t *testing.T) {
+	c := validOIDC()
+	c.GoogleAdminSDK = GoogleAdminSDKConfig{Enabled: false}
+	require.NoError(t, ValidateOIDC(c))
+}
+
+func TestValidateOIDC_GoogleAdminSDK_RequiresSubject(t *testing.T) {
+	c := validOIDC()
+	c.GoogleAdminSDK = GoogleAdminSDKConfig{Enabled: true, ServiceAccountKey: `{"client_email":"x"}`}
+	err := ValidateOIDC(c)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "oidc.google_admin_sdk.subject_email")
+}
+
+func TestValidateOIDC_GoogleAdminSDK_RequiresKeyOrKeyFile(t *testing.T) {
+	c := validOIDC()
+	c.GoogleAdminSDK = GoogleAdminSDKConfig{Enabled: true, SubjectEmail: "admin@company.com"}
+	err := ValidateOIDC(c)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "service_account_key")
+}
+
+func TestValidateOIDC_GoogleAdminSDK_KeyFileIsEnough(t *testing.T) {
+	c := validOIDC()
+	c.GoogleAdminSDK = GoogleAdminSDKConfig{Enabled: true, SubjectEmail: "admin@company.com", ServiceAccountKeyFile: "/run/secrets/key.json"}
+	require.NoError(t, ValidateOIDC(c))
+}
+
+func TestLoad_GoogleAdminSDK_FromEnv(t *testing.T) {
+	t.Setenv("NEXSPENCE_OIDC_GOOGLE_ADMIN_SDK_ENABLED", "true")
+	t.Setenv("NEXSPENCE_OIDC_GOOGLE_ADMIN_SDK_SUBJECT_EMAIL", "admin@company.com")
+	t.Setenv("NEXSPENCE_OIDC_GOOGLE_ADMIN_SDK_SERVICE_ACCOUNT_KEY", `{"client_email":"sa@p.iam.gserviceaccount.com"}`)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(""+
+		"database:\n  dsn: \"postgres://u:p@localhost:5432/db?sslmode=disable\"\n"+
+		"auth:\n  jwt_secret: \"a-unique-production-secret-at-least-32b\"\n"), 0o600))
+	cfg, err := Load(path)
+	require.NoError(t, err)
+	assert.True(t, cfg.OIDC.GoogleAdminSDK.Enabled)
+	assert.Equal(t, "admin@company.com", cfg.OIDC.GoogleAdminSDK.SubjectEmail)
+	assert.Contains(t, cfg.OIDC.GoogleAdminSDK.ServiceAccountKey, "sa@p.iam")
 }

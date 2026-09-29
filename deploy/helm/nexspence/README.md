@@ -6,7 +6,7 @@ Nexspence — open-source universal artifact repository manager (Nexus OSS alter
 
 - Helm 3.x
 - Kubernetes >= 1.26
-- PersistentVolume provisioner (for local blob storage) or S3-compatible storage
+- PersistentVolume provisioner (for local blob storage), S3-compatible storage, or Azure Blob Storage
 
 ---
 
@@ -39,7 +39,9 @@ Then install with exactly one of the networking options below. The chart
 bundles a single-replica PostgreSQL from the official `postgres` image — no
 sub-chart download is required.
 
-> **JWT secret:** `config.jwtSecret` is optional. When omitted, the chart auto-generates a unique random secret on first install and reuses it across upgrades (via a `lookup` of the existing Secret). The `--set config.jwtSecret=...` in the examples below is only needed to pin a known value or share the secret across clusters.
+> **JWT secret:** `config.jwtSecret` is optional. When omitted, the chart auto-generates a unique random secret on first install and reuses it across upgrades (via a `lookup` of the existing Secret). Point `config.jwtSecretExistingSecret` at a Secret you already have instead — the chart then neither generates nor stores the key. Bootstrap admin (`config.adminExistingSecret`) and the OIDC cookie key (`oidc.cookieKeyExistingSecret`) are the same, and `config.bootstrapEnabled=false` keeps the admin credentials out of the Secret entirely. See `values-examples/existing-secrets.yaml`. `--set config.jwtSecret=...` is only needed to pin a known value or share it across clusters.
+
+> **Rendering without a cluster:** the reuse above is a `lookup`, which only a real install/upgrade can answer, so under `helm template` (Argo CD included) every render mints a new JWT secret and cookie key. Use the existing-Secret options there.
 
 ### nginx ingress-controller
 
@@ -92,6 +94,19 @@ helm install nexspence \
   --create-namespace
 ```
 
+To attach the VirtualService to a Gateway that already exists, set
+`gateway.istio.existingGateway` (`name` or `namespace/name`). The chart then does not create a Gateway. `gatewaySelector` is only the workload labels on a chart-created Gateway (`spec.selector`), not a Gateway CR name.
+```yaml
+gateway:
+  istio:
+    enabled: true
+    existingGateway: istio-system/istio-ingressgateway
+    hosts:
+      - nexspence.example.com
+```
+
+See `values-examples/istio-existing-gateway.yaml`.
+
 ### Cilium K8s Gateway API (>= 1.14)
 
 ```bash
@@ -126,7 +141,7 @@ helm install nexspence \
 
 To keep the DSN out of values, put it in a Secret and set
 `externalDatabase.existingSecret` (key `dsn` by default, override with
-`existingSecretDsnKey`). The bundled chart can likewise take
+`existingSecretKey`). The bundled chart can likewise take
 `postgresql.auth.existingSecret` / `existingSecretPasswordKey` instead of
 `postgresql.auth.password`.
 
@@ -154,6 +169,16 @@ kubectl rollout restart -n nexspence deployment/nexspence
 
 ---
 
+## Adding further local blob stores
+
+The chart mounts the blob PVC at `storage.local.mountPath` (default `/blobs`)
+and the container root filesystem is otherwise read-only. Additional local blob
+stores created in the UI must use a path under that mount; a path such as
+`/app/data/blobs/<name>` lands on the read-only root and the first upload
+fails.
+
+---
+
 ## S3 / MinIO Blob Store
 
 Set `storage.type=s3` and provide bucket + endpoint. Use this
@@ -172,6 +197,53 @@ helm install nexspence \
   --namespace nexspence \
   --create-namespace
 ```
+
+---
+
+## Azure Blob Storage
+
+Set `storage.type=azure` and provide an existing container. Use this
+for any multi-replica deployment — a single `ReadWriteOnce` PVC does not scale
+horizontally. Exactly one credential path is required: account key,
+connection string, SAS token, or the pod's Entra ID identity (leave every
+credential empty and set `serviceAccount.annotations` for workload identity).
+
+```bash
+helm install nexspence \
+  deploy/helm/nexspence \
+  --set storage.type=azure \
+  --set storage.azure.container="nexspence-blobs" \
+  --set storage.azure.accountName="mystorage" \
+  --set storage.azure.accountKey="..." \
+  -f deploy/helm/nexspence/values-examples/nginx.yaml \
+  --namespace nexspence \
+  --create-namespace
+```
+
+Prefer an existing Secret over putting the key in values:
+
+```yaml
+storage:
+  type: azure
+  azure:
+    container: nexspence-blobs
+    accountName: mystorage
+    existingSecret: nexspence-azure
+    existingSecretKind: accountKey   # or connectionString / sasToken
+    existingSecretKey: account-key
+```
+
+### AKS Workload Identity (recommended for Azure)
+
+For AKS, use a user-assigned managed identity and leave all Azure credential
+values empty. The chart already supports the required ServiceAccount
+annotations and pod label. Start with
+[the ready-to-render example](values-examples/azure-workload-identity.yaml)
+and follow the complete [AKS Workload Identity guide](../../../docs/azure-workload-identity.md).
+The identity needs `Storage Blob Data Contributor` on the container. Add
+`Storage Blob Delegator` on the storage account when Nexspence must generate
+user-delegation SAS URLs; the container data role alone does not grant that
+account-level action.
 
 ---
 
@@ -234,6 +306,26 @@ nothing else in the chart changes behaviour.
 
 ---
 
+## Google Workspace groups (OIDC)
+
+A Google id_token never carries groups, so `oidc.adminGroup` / role mappings
+do nothing for Google logins unless Nexspence looks the groups up itself.
+Create a service account with domain-wide delegation for
+`admin.directory.group.readonly`, store its JSON key in a Secret, and:
+
+```bash
+kubectl create secret generic nexspence-google-sa --from-file=key.json=./sa-key.json
+helm upgrade --install nexspence oci://ghcr.io/nexspence/charts/nexspence \
+  --set oidc.enabled=true \
+  --set oidc.googleAdminSDK.enabled=true \
+  --set oidc.googleAdminSDK.serviceAccountKeyExistingSecret=nexspence-google-sa \
+  --set oidc.googleAdminSDK.subjectEmail=admin@company.com \
+  --set oidc.adminGroup=nexspence-admins@company.com
+```
+
+Groups are matched by email. A failed lookup never locks a user out or
+strips their roles — see `docs/oidc-setup.md`.
+
 ## Scaling (HPA)
 
 ```bash
@@ -247,7 +339,7 @@ helm install nexspence \
   --create-namespace
 ```
 
-For multi-replica deployments, use S3 storage (see above).
+For multi-replica deployments, use S3 or Azure storage (see above).
 
 ---
 
@@ -342,6 +434,13 @@ It also will not magically convert the data directory. Do this instead:
 2. Uninstall the release, or delete the old Bitnami StatefulSet / Service /
    Secret. Kubernetes keeps volumeClaimTemplates PVCs when the StatefulSet
    goes away, so `data-nexspence-postgresql-0` remains as a dump source.
+
+   While the Bitnami StatefulSet `nexspence-postgresql` still exists,
+   `helm upgrade` stops with an error instead of starting an empty database.
+   If you have already dumped and want to keep the old StatefulSet around for
+   now, add `--set postgresql.acknowledgeBitnamiMigration=true`. The check is
+   a cluster lookup: `helm template`, Argo CD and Flux never run it, so on
+   GitOps follow these steps by hand.
 
 3. Re-install this chart. The new StatefulSet is `nexspence-postgres`
    (PVC `data-nexspence-postgres-0`). If you previously set Bitnami values

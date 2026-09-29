@@ -9,11 +9,13 @@ import {
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import styles from './Layout.module.css'
 import { useAuthStore } from '@/store/authStore'
-import { apiClient } from '@/api/client'
+import { apiClient, nexusApi, apiErrorMessage } from '@/api/client'
+import { usePasswordMinLength, tooShort, passwordTooShortMessage } from '@/hooks/usePasswordPolicy'
 import logo from '@/assets/logo.png'
 import miniLogo from '@/assets/mini_logo.png'
 import { HoloApp, HoloModal, HoloButton, HoloInput } from '@/components/holo'
 import { Truncated } from '@/components/Truncated'
+import { ThemeToggle } from '@/components/ThemeToggle'
 
 const navItems = [
   { to: '/repositories', icon: Home,       label: 'Repositories' },
@@ -89,11 +91,49 @@ function ProfileModal({ onClose }: { onClose: () => void }) {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['my-tokens'] }),
   })
 
+  // ── Change password (local accounts only) ─────────────────
+  const [curPw, setCurPw] = useState('')
+  const [newPw, setNewPw] = useState('')
+  const [confirmPw, setConfirmPw] = useState('')
+  const [pwErr, setPwErr] = useState('')
+  const [pwChanged, setPwChanged] = useState(false)
+  const pwMinLength = usePasswordMinLength()
+
+  // A missing source predates the field (an older build issued the session) —
+  // treat it as local so dev/bootstrap keeps working; only a *known* external
+  // source hides the section (no dead inputs for SSO users).
+  const isLocalAccount = !user?.source || user.source === 'local'
+
+  const changePw = useMutation({
+    mutationFn: ({ oldPassword, newPassword }: { oldPassword: string; newPassword: string }) =>
+      nexusApi.changeMyPassword(oldPassword, newPassword),
+    onSuccess: () => {
+      setPwChanged(true)
+      // The backend revokes every JWT on a password change (tokens_valid_after
+      // is bumped) — including this session's. Keeping the UI "logged in" would
+      // just 401 on the next call, so the honest UX is to sign the user out
+      // here and have them return with the new password. The store singleton is
+      // read fresh so this logout is the live one, not a stale render closure.
+      setTimeout(() => useAuthStore.getState().logout(), 1500)
+    },
+    onError: (e) => setPwErr(apiErrorMessage(e, 'Failed to change password')),
+  })
+
+  function submitPasswordChange(e: React.FormEvent) {
+    e.preventDefault()
+    if (newPw !== confirmPw) { setPwErr('The two passwords do not match'); return }
+    // A mirror of the server rule, so the user is told before the round trip.
+    // The server still enforces it — an unknown minimum just submits.
+    if (tooShort(newPw, pwMinLength)) { setPwErr(passwordTooShortMessage(pwMinLength as number)); return }
+    setPwErr('')
+    changePw.mutate({ oldPassword: curPw, newPassword: newPw })
+  }
+
   const S = {
     header:    { display: 'flex', alignItems: 'center', justifyContent: 'space-between' },
     title:     { fontSize: 16, fontWeight: 700, color: 'var(--holo-text)', display: 'flex', alignItems: 'center', gap: 8 },
     tokenList: { maxHeight: 240, overflowY: 'auto' as const, display: 'flex', flexDirection: 'column' as const },
-    row:       { display: 'flex', alignItems: 'flex-start', gap: 10, padding: '10px 0', borderBottom: '1px solid rgba(255,255,255,0.06)', minWidth: 0 },
+    row:       { display: 'flex', alignItems: 'flex-start', gap: 10, padding: '10px 0', borderBottom: '1px solid rgba(var(--holo-ink-rgb), 0.06)', minWidth: 0 },
     rowMeta:   { flex: 1, minWidth: 0 },
     rowName:   { fontWeight: 600, fontSize: 13, color: 'var(--holo-text)' },
     rowDates:  { fontSize: 11, color: 'var(--holo-text-dim)', marginTop: 2, lineHeight: 1.4 },
@@ -147,7 +187,7 @@ function ProfileModal({ onClose }: { onClose: () => void }) {
                 icon={<Plus size={14} />}
                 onClick={create}
                 disabled={creating || !name.trim() || !!expiryError}
-                style={{ background: 'rgba(59,130,246,0.15)', borderColor: 'rgba(59,130,246,0.4)', color: '#60a5fa', whiteSpace: 'nowrap' }}
+                style={{ background: 'rgba(59,130,246,0.15)', borderColor: 'rgba(59,130,246,0.4)', color: 'var(--holo-c-blue-400)', whiteSpace: 'nowrap' }}
               >
                 {creating ? 'Creating…' : 'Create token'}
               </HoloButton>
@@ -166,7 +206,7 @@ function ProfileModal({ onClose }: { onClose: () => void }) {
             <div style={{ fontSize: 13, color: 'var(--holo-green)', fontWeight: 600, marginBottom: 8 }}>
               Token created — copy it now, it won't be shown again
             </div>
-            <code style={{ ...S.mono, fontSize: 12, background: 'rgba(0,0,0,0.3)', padding: '8px 12px', borderRadius: 8, display: 'block', wordBreak: 'break-all' as const, color: 'var(--holo-a)' }}>
+            <code style={{ ...S.mono, fontSize: 12, background: 'var(--holo-well-30)', padding: '8px 12px', borderRadius: 8, display: 'block', wordBreak: 'break-all' as const, color: 'var(--holo-a)' }}>
               {newToken.token}
             </code>
             <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
@@ -174,7 +214,7 @@ function ProfileModal({ onClose }: { onClose: () => void }) {
                 variant="primary"
                 icon={copied ? <Check size={14} /> : <Copy size={14} />}
                 onClick={copyToken}
-                style={copied ? { background: 'rgba(34,211,238,0.2)', borderColor: 'rgba(34,211,238,0.4)', color: '#22d3ee' } : undefined}
+                style={copied ? { background: 'rgba(34,211,238,0.2)', borderColor: 'rgba(34,211,238,0.4)', color: 'var(--holo-b)' } : undefined}
               >
                 {copied ? 'Copied!' : 'Copy'}
               </HoloButton>
@@ -211,6 +251,45 @@ function ProfileModal({ onClose }: { onClose: () => void }) {
               )
           }
         </div>
+
+        {isLocalAccount && (pwChanged ? (
+          <div className="holo-card" style={{ padding: 16, background: 'rgba(94,255,184,0.08)', border: '1px solid rgba(94,255,184,0.25)' }}>
+            <div style={{ fontSize: 13, color: 'var(--holo-green)', fontWeight: 600 }}>
+              Password changed — please sign in again.
+            </div>
+            <div style={{ fontSize: 11, color: 'var(--holo-text-faint)', marginTop: 4 }}>
+              Signing you out… every browser session was revoked. API tokens are
+              separate credentials and keep working.
+            </div>
+          </div>
+        ) : (
+          <div className="holo-card" style={{ padding: 16 }}>
+            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--holo-text)', marginBottom: 10 }}>Change Password</div>
+            <form onSubmit={submitPasswordChange} style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label htmlFor="cur-password" style={{ fontSize: 12, color: 'var(--holo-text-faint)' }}>Current password</label>
+                <HoloInput id="cur-password" type="password" value={curPw} onChange={e => setCurPw(e.target.value)} required autoComplete="current-password" />
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label htmlFor="new-password" style={{ fontSize: 12, color: 'var(--holo-text-faint)' }}>New password</label>
+                <HoloInput id="new-password" type="password" value={newPw} onChange={e => setNewPw(e.target.value)} required autoComplete="new-password" />
+                {pwMinLength !== undefined && (
+                  <div style={{ fontSize: 11, color: 'var(--holo-text-faint)' }}>At least {pwMinLength} characters</div>
+                )}
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label htmlFor="new-password-confirm" style={{ fontSize: 12, color: 'var(--holo-text-faint)' }}>Confirm new password</label>
+                <HoloInput id="new-password-confirm" type="password" value={confirmPw} onChange={e => setConfirmPw(e.target.value)} required autoComplete="new-password" />
+              </div>
+              {pwErr && <div role="alert" style={{ fontSize: 11, color: 'var(--holo-red)' }}>{pwErr}</div>}
+              <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 4 }}>
+                <HoloButton variant="primary" type="submit" disabled={changePw.isPending}>
+                  {changePw.isPending ? 'Saving…' : 'Change password'}
+                </HoloButton>
+              </div>
+            </form>
+          </div>
+        ))}
       </div>
     </HoloModal>
   )
@@ -366,13 +445,16 @@ export default function Layout() {
           </div>
         )}
         <span className={styles.version}>Nexspence v{systemInfo?.version ?? '…'}</span>
-        <button
-          className={styles.collapseButton}
-          onClick={toggleCollapse}
-          title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-        >
-          {collapsed ? <ChevronRight size={13} /> : <ChevronLeft size={13} />}
-        </button>
+        <div className={styles.footerRow}>
+          <ThemeToggle className={styles.themeToggle} />
+          <button
+            className={styles.collapseButton}
+            onClick={toggleCollapse}
+            title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          >
+            {collapsed ? <ChevronRight size={13} /> : <ChevronLeft size={13} />}
+          </button>
+        </div>
       </aside>
 
       <main id="main-content" className={styles.main}>

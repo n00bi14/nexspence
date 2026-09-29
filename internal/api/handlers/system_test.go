@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -15,6 +16,7 @@ import (
 	"github.com/nexspence-oss/nexspence/internal/auth"
 	"github.com/nexspence-oss/nexspence/internal/config"
 	"github.com/nexspence-oss/nexspence/internal/domain"
+	"github.com/nexspence-oss/nexspence/internal/storage"
 	"github.com/nexspence-oss/nexspence/internal/testutil"
 )
 
@@ -287,6 +289,28 @@ func TestSystem_Services_DockerConnectorEnabledNoBaseDomain(t *testing.T) {
 	assert.Equal(t, "warn", dsc.Status)
 }
 
+// TestSystem_Services_EveryStatusHasCheckedAt guards the whole response: a check
+// that reports config instead of probing (the Docker connector) used to leave the
+// timestamp empty, which the admin page rendered as "Invalid Date".
+func TestSystem_Services_EveryStatusHasCheckedAt(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Docker.SubdomainConnector.Enabled = true
+	cfg.Docker.SubdomainConnector.BaseDomain = "docker.example.com"
+	cfg.Redis.Enabled = true
+	r := mountSystem(t, cfg, nil, nil, nil, nil)
+
+	rec := do(t, r, http.MethodGet, "/api/v1/system/services", nil)
+	require.Equal(t, http.StatusOK, rec.Code)
+	svcs := parseServices(t, rec.Body.Bytes())
+	require.NotEmpty(t, svcs)
+
+	for _, s := range svcs {
+		assert.NotEmpty(t, s.CheckedAt, "%s reports no check time", s.Name)
+		_, err := time.Parse(time.RFC3339, s.CheckedAt)
+		assert.NoError(t, err, "%s: %q is not RFC3339", s.Name, s.CheckedAt)
+	}
+}
+
 // TestSystem_Services_RedisEnabled covers the redis error branch (unreachable addr).
 func TestSystem_Services_RedisEnabled(t *testing.T) {
 	cfg := &config.Config{}
@@ -338,6 +362,39 @@ func TestSystem_Services_S3BlobStoreProbe(t *testing.T) {
 	// The local blob store must NOT produce its own S3 endpoint check.
 	_, hasLocalS3 := findService(svcs, "S3 · ")
 	assert.False(t, hasLocalS3)
+}
+
+func TestSystem_Info_NormalizesEmptyStorage(t *testing.T) {
+	cfg := &config.Config{}
+	h := handlers.NewSystemHandler(cfg, newUnreachablePool(t), nil, nil).WithVersion("1.2.3")
+	r := gin.New()
+	r.GET("/api/v1/system/info", h.Info)
+
+	rec := do(t, r, http.MethodGet, "/api/v1/system/info", nil)
+	require.Equal(t, http.StatusOK, rec.Code)
+	var got handlers.SystemInfo
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	assert.Equal(t, "1.2.3", got.Version)
+	assert.Equal(t, "Nexspence", got.Product)
+	assert.Equal(t, "local", got.Storage.DefaultType)
+	assert.Equal(t, storage.DefaultLocalBasePath, got.Storage.Local.BasePath)
+}
+
+func TestSystem_Info_ReportsConfiguredBasePath(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Storage.DefaultType = "s3"
+	cfg.Storage.Local.BasePath = "/blobs"
+	h := handlers.NewSystemHandler(cfg, newUnreachablePool(t), nil, nil).WithVersion("9.9.9")
+	r := gin.New()
+	r.GET("/api/v1/system/info", h.Info)
+
+	rec := do(t, r, http.MethodGet, "/api/v1/system/info", nil)
+	require.Equal(t, http.StatusOK, rec.Code)
+	var got handlers.SystemInfo
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
+	assert.Equal(t, "9.9.9", got.Version)
+	assert.Equal(t, "s3", got.Storage.DefaultType)
+	assert.Equal(t, "/blobs", got.Storage.Local.BasePath)
 }
 
 // assertErr is a tiny error helper to avoid importing errors in many spots.

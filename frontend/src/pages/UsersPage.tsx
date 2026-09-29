@@ -1,10 +1,12 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { UserPlus, Trash2, RefreshCw, Shield, User, AlertTriangle, Plus, Edit2 } from 'lucide-react'
+import { UserPlus, Trash2, RefreshCw, Shield, User, AlertTriangle, Plus, Edit2, KeyRound, Pencil } from 'lucide-react'
 import { nexusApi, apiClient, apiErrorMessage } from '@/api/client'
 import styles from './UsersPage.module.css'
 import { Select } from '../components/Select'
 import { HoloTabs, HoloPill, HoloButton, HoloInput, HoloModal, HoloCard } from '@/components/holo'
+import { useAuthStore } from '@/store/authStore'
+import { usePasswordMinLength, tooShort, passwordTooShortMessage } from '@/hooks/usePasswordPolicy'
 
 /* ─── Types ─────────────────────────────────────────────────── */
 interface UserItem {
@@ -72,12 +74,12 @@ export function AssignRolesModal({ user, roles, onClose, onSaved }: {
   const headerStyle: React.CSSProperties = {
     padding: '6px 10px', fontSize: 11, fontWeight: 600, color: 'var(--holo-text-dim)',
     textTransform: 'uppercase' as const, letterSpacing: '0.4px',
-    borderBottom: '1px solid rgba(255,255,255,0.06)', background: 'rgba(0,0,0,0.2)',
+    borderBottom: '1px solid rgba(var(--holo-ink-rgb), 0.06)', background: 'var(--holo-well-20)',
   }
   const listStyle: React.CSSProperties = { maxHeight: 200, overflowY: 'auto' as const }
   const itemBase: React.CSSProperties = {
     padding: '7px 10px', fontSize: 12, cursor: 'pointer',
-    borderBottom: '1px solid rgba(255,255,255,0.03)',
+    borderBottom: '1px solid rgba(var(--holo-ink-rgb), 0.03)',
   }
   const arrowBtn: React.CSSProperties = {
     width: 28, height: 28, display: 'flex', alignItems: 'center', justifyContent: 'center',
@@ -93,7 +95,7 @@ export function AssignRolesModal({ user, roles, onClose, onSaved }: {
         {/* Available */}
         <div style={panelStyle}>
           <div style={headerStyle}>Available ({roles.filter(r => !selected.includes(r.id)).length})</div>
-          <div style={{ padding: '4px 6px', borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
+          <div style={{ padding: '4px 6px', borderBottom: '1px solid rgba(var(--holo-ink-rgb), 0.05)' }}>
             <input
               placeholder="Filter…"
               value={leftSearch}
@@ -130,7 +132,7 @@ export function AssignRolesModal({ user, roles, onClose, onSaved }: {
         {/* Selected */}
         <div style={panelStyle}>
           <div style={headerStyle}>Selected ({selected.length})</div>
-          <div style={{ padding: '4px 6px', borderBottom: '1px solid rgba(255,255,255,0.05)' }}>
+          <div style={{ padding: '4px 6px', borderBottom: '1px solid rgba(var(--holo-ink-rgb), 0.05)' }}>
             <input
               placeholder="Filter…"
               value={rightSearch}
@@ -141,15 +143,15 @@ export function AssignRolesModal({ user, roles, onClose, onSaved }: {
           </div>
           <div style={listStyle}>
             {selectedRoles.map(r => (
-              <div key={r.id} style={{ ...itemBase, color: '#c4b5fd', background: 'rgba(124,92,255,0.12)', display: 'flex', alignItems: 'flex-start', gap: 6 }}
+              <div key={r.id} style={{ ...itemBase, color: 'var(--holo-c-violet-300)', background: 'rgba(124,92,255,0.12)', display: 'flex', alignItems: 'flex-start', gap: 6 }}
                 onClick={() => remove(r.id)}
                 onMouseEnter={e => (e.currentTarget as HTMLDivElement).style.background = 'rgba(124,92,255,0.2)'}
                 onMouseLeave={e => (e.currentTarget as HTMLDivElement).style.background = 'rgba(124,92,255,0.12)'}
               >
-                <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#7c5cff', flexShrink: 0, display: 'inline-block', marginTop: 4 }} />
+                <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--holo-a)', flexShrink: 0, display: 'inline-block', marginTop: 4 }} />
                 <div>
                   <div style={{ fontWeight: 600 }}>{r.name}</div>
-                  {r.description && <div style={{ fontSize: 11, color: 'rgba(196,181,253,0.6)', marginTop: 1 }}>{r.description}</div>}
+                  {r.description && <div style={{ fontSize: 11, color: 'var(--holo-tx-violet-300-60)', marginTop: 1 }}>{r.description}</div>}
                 </div>
               </div>
             ))}
@@ -173,12 +175,150 @@ export function AssignRolesModal({ user, roles, onClose, onSaved }: {
   )
 }
 
+/* ─── Edit user modal ───────────────────────────────────────── */
+// UserService.Update applies its fields partially: an empty string means "keep
+// what is there", not "clear it". So a field left blank here stays as it was —
+// said out loud in the modal, because an admin blanking an email and getting
+// the old one back has no other way to find out why.
+export function EditUserModal({ user, onClose, onSaved }: {
+  user: UserItem
+  onClose: () => void
+  onSaved: () => void
+}) {
+  const [form, setForm] = useState({
+    firstName: user.firstName ?? '',
+    lastName: user.lastName ?? '',
+    emailAddress: user.emailAddress ?? '',
+    status: user.status ?? 'active',
+  })
+  const [saving, setSaving] = useState(false)
+  const [err, setErr] = useState('')
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setSaving(true); setErr('')
+    try {
+      await nexusApi.updateUser(user.userId, form)
+      onSaved()
+    } catch (e) {
+      setErr(apiErrorMessage(e, 'Failed to update user'))
+    } finally { setSaving(false) }
+  }
+
+  return (
+    <HoloModal open={true} onClose={onClose}>
+      <h2 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: 'var(--holo-text)' }}>Edit User — {user.userId}</h2>
+      <form onSubmit={submit} className={styles.form}>
+        <div className={styles.formGrid}>
+          <div className={styles.formRow}>
+            <label className={styles.label} htmlFor="edit-first-name">First name</label>
+            <HoloInput id="edit-first-name" value={form.firstName} onChange={e => setForm(f => ({ ...f, firstName: e.target.value }))} />
+          </div>
+          <div className={styles.formRow}>
+            <label className={styles.label} htmlFor="edit-last-name">Last name</label>
+            <HoloInput id="edit-last-name" value={form.lastName} onChange={e => setForm(f => ({ ...f, lastName: e.target.value }))} />
+          </div>
+        </div>
+        <div className={styles.formRow}>
+          <label className={styles.label} htmlFor="edit-email">Email</label>
+          <HoloInput id="edit-email" type="email" value={form.emailAddress} onChange={e => setForm(f => ({ ...f, emailAddress: e.target.value }))} />
+        </div>
+        <div className={styles.formRow}>
+          <label className={styles.label}>Status</label>
+          <Select
+            options={[
+              { value: 'active',   label: 'Active' },
+              { value: 'disabled', label: 'Disabled' },
+            ]}
+            value={form.status}
+            onChange={v => setForm(f => ({ ...f, status: v }))}
+          />
+        </div>
+        <div style={{ fontSize: 11, color: 'var(--holo-text-faint)' }}>
+          Emptying a field leaves it unchanged — the API applies these fields partially.
+        </div>
+        {err && <div role="alert" className={styles.error}>{err}</div>}
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 8 }}>
+          <HoloButton type="button" onClick={onClose}>Cancel</HoloButton>
+          <HoloButton variant="primary" type="submit" disabled={saving}>{saving ? 'Saving…' : 'Save'}</HoloButton>
+        </div>
+      </form>
+    </HoloModal>
+  )
+}
+
+/* ─── Reset password modal ──────────────────────────────────── */
+// An admin resetting somebody else's password does not send a current one:
+// this is the admin route (:userId in the path), which takes the SetPassword
+// branch. The self route — the profile modal — always verifies the current
+// password, whatever the caller's role.
+export function ResetPasswordModal({ user, onClose, onSaved }: {
+  user: UserItem
+  onClose: () => void
+  onSaved: () => void
+}) {
+  const [password, setPassword] = useState('')
+  const [confirmation, setConfirmation] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [err, setErr] = useState('')
+  const minLength = usePasswordMinLength()
+  // Resetting your own password revokes your own sessions too, so the page
+  // would simply bounce to /login on its next call. Say so beforehand rather
+  // than letting it look like a crash.
+  const isSelf = useAuthStore(s => s.user?.username) === user.userId
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (password !== confirmation) { setErr('The two passwords do not match'); return }
+    if (tooShort(password, minLength)) { setErr(passwordTooShortMessage(minLength as number)); return }
+    setSaving(true); setErr('')
+    try {
+      await nexusApi.changePassword(user.userId, password)
+      onSaved()
+    } catch (e) {
+      setErr(apiErrorMessage(e, 'Failed to reset password'))
+    } finally { setSaving(false) }
+  }
+
+  return (
+    <HoloModal open={true} onClose={onClose}>
+      <h2 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: 'var(--holo-text)' }}>Reset Password — {user.userId}</h2>
+      <form onSubmit={submit} className={styles.form}>
+        <div className={styles.formRow}>
+          <label className={styles.label} htmlFor="reset-password">New password *</label>
+          <HoloInput id="reset-password" type="password" value={password} onChange={e => setPassword(e.target.value)} required autoComplete="new-password" />
+          {minLength !== undefined && (
+            <div style={{ fontSize: 11, color: 'var(--holo-text-faint)' }}>At least {minLength} characters</div>
+          )}
+        </div>
+        <div className={styles.formRow}>
+          <label className={styles.label} htmlFor="reset-password-confirm">Confirm new password *</label>
+          <HoloInput id="reset-password-confirm" type="password" value={confirmation} onChange={e => setConfirmation(e.target.value)} required autoComplete="new-password" />
+        </div>
+        {isSelf && (
+          <div style={{ fontSize: 11, color: 'var(--holo-text-faint)' }}>
+            This is your own account — the reset revokes every browser session,
+            including this one, and you will be asked to sign in again.
+          </div>
+        )}
+        {err && <div role="alert" className={styles.error}>{err}</div>}
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 8 }}>
+          <HoloButton type="button" onClick={onClose}>Cancel</HoloButton>
+          <HoloButton variant="primary" type="submit" disabled={saving}>{saving ? 'Saving…' : 'Reset Password'}</HoloButton>
+        </div>
+      </form>
+    </HoloModal>
+  )
+}
+
 /* ─── Users tab ──────────────────────────────────────────────── */
 export function UsersTab() {
   const qc = useQueryClient()
   const [filter, setFilter] = useState('')
   const [showCreate, setShowCreate] = useState(false)
   const [assignUser, setAssignUser] = useState<UserItem | null>(null)
+  const [resetUser, setResetUser] = useState<UserItem | null>(null)
+  const [editUser, setEditUser] = useState<UserItem | null>(null)
 
   const { data: users = [], isLoading, isError, error, refetch } = useQuery<UserItem[]>({
     queryKey: ['users'],
@@ -238,15 +378,15 @@ export function UsersTab() {
             const fullName = [user.firstName, user.lastName].filter(Boolean).join(' ')
             return (
               <div key={user.userId} style={{
-                display: 'grid', gridTemplateColumns: '8px 1fr auto auto auto',
+                display: 'grid', gridTemplateColumns: '8px 1fr auto auto auto auto auto',
                 alignItems: 'center', gap: 12, padding: '11px 16px',
-                background: 'rgba(10,8,28,0.97)', border: '1px solid rgba(124,92,255,0.2)',
+                background: 'var(--holo-surface-float)', border: '1px solid rgba(124,92,255,0.2)',
                 borderRadius: 10, transition: 'border-color 0.15s, background 0.15s',
               }}
               onMouseEnter={e => { (e.currentTarget as HTMLDivElement).style.borderColor = 'rgba(124,92,255,0.45)'; (e.currentTarget as HTMLDivElement).style.background = 'rgba(124,92,255,0.04)' }}
-              onMouseLeave={e => { (e.currentTarget as HTMLDivElement).style.borderColor = 'rgba(124,92,255,0.2)'; (e.currentTarget as HTMLDivElement).style.background = 'rgba(10,8,28,0.97)' }}
+              onMouseLeave={e => { (e.currentTarget as HTMLDivElement).style.borderColor = 'rgba(124,92,255,0.2)'; (e.currentTarget as HTMLDivElement).style.background = 'var(--holo-surface-float)' }}
               >
-                <span style={{ width: 7, height: 7, borderRadius: '50%', flexShrink: 0, display: 'inline-block', background: isActive ? 'var(--holo-green)' : 'rgba(255,255,255,0.2)', boxShadow: isActive ? '0 0 5px var(--holo-green)' : 'none' }} />
+                <span style={{ width: 7, height: 7, borderRadius: '50%', flexShrink: 0, display: 'inline-block', background: isActive ? 'var(--holo-green)' : 'rgba(var(--holo-ink-rgb), 0.2)', boxShadow: isActive ? '0 0 5px var(--holo-green)' : 'none' }} />
                 <div style={{ minWidth: 0 }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                     <User size={13} style={{ color: 'var(--holo-a)', flexShrink: 0 }} />
@@ -264,6 +404,14 @@ export function UsersTab() {
                   </HoloButton>
                 </div>
                 <HoloPill style={{ fontSize: 11 }}>{user.source}</HoloPill>
+                <HoloButton style={{ padding: 5 }} disabled={user.source !== 'local'} onClick={() => setEditUser(user)}
+                  title={user.source !== 'local'
+                    ? `A ${user.source} account's profile is re-provisioned from the identity provider on every login`
+                    : 'Edit user'}><Pencil size={14} /></HoloButton>
+                <HoloButton style={{ padding: 5 }} disabled={user.source !== 'local'} onClick={() => setResetUser(user)}
+                  title={user.source !== 'local'
+                    ? `A ${user.source} account's password is managed by the identity provider`
+                    : 'Reset password'}><KeyRound size={14} /></HoloButton>
                 <HoloButton variant="danger" style={{ padding: 5 }} disabled={user.userId === 'admin'} onClick={() => {
                   if (confirm(`Delete user "${user.userId}"?`)) deleteMutation.mutate(user.userId)
                 }} title="Delete user"><Trash2 size={14} /></HoloButton>
@@ -283,6 +431,17 @@ export function UsersTab() {
       {assignUser && (
         <AssignRolesModal user={assignUser} roles={roles} onClose={() => setAssignUser(null)} onSaved={() => {
           setAssignUser(null)
+          qc.invalidateQueries({ queryKey: ['users'] })
+        }} />
+      )}
+
+      {resetUser && (
+        <ResetPasswordModal user={resetUser} onClose={() => setResetUser(null)} onSaved={() => setResetUser(null)} />
+      )}
+
+      {editUser && (
+        <EditUserModal user={editUser} onClose={() => setEditUser(null)} onSaved={() => {
+          setEditUser(null)
           qc.invalidateQueries({ queryKey: ['users'] })
         }} />
       )}
@@ -362,7 +521,7 @@ function RolesTab() {
       ) : (
         <HoloCard style={{ padding: 0 }}>
           {roles.map((r, i) => (
-            <div key={r.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 16px', borderBottom: i < roles.length - 1 ? '1px solid rgba(255,255,255,0.06)' : 'none' }}>
+            <div key={r.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 16px', borderBottom: i < roles.length - 1 ? '1px solid rgba(var(--holo-ink-rgb), 0.06)' : 'none' }}>
               <Shield size={15} style={{ color: 'var(--holo-a)', flexShrink: 0 }} />
               <div style={{ flex: 1 }}>
                 <div style={{ color: 'var(--holo-text)', fontWeight: 600 }}>{r.name}</div>
@@ -392,7 +551,7 @@ export default function UsersPage() {
     <div className={styles.page}>
       <div style={{ marginBottom: 24 }}>
         <div className="holo-section-label" style={{ marginBottom: 4 }}>ADMINISTRATION / USERS</div>
-        <h1 style={{ fontSize: 20, fontWeight: 700, margin: '0 0 3px', letterSpacing: '-0.01em', lineHeight: 1.2, background: 'linear-gradient(110deg, #7c5cff, #22d3ee 60%)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text' as const }}>Users</h1>
+        <h1 style={{ fontSize: 20, fontWeight: 700, margin: '0 0 3px', letterSpacing: '-0.01em', lineHeight: 1.2, background: 'linear-gradient(110deg, var(--holo-a), var(--holo-b) 60%)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text' as const }}>Users</h1>
         <p style={{ fontSize: 12, color: 'var(--holo-text-faint)', margin: 0 }}>Manage users and roles</p>
       </div>
       <HoloTabs
@@ -412,12 +571,17 @@ export default function UsersPage() {
 
 /* ─── Create user modal ──────────────────────────────────────── */
 export function CreateUserModal({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
-  const [form, setForm] = useState({ userId: '', email: '', firstName: '', lastName: '', password: '', status: 'active' })
+  const [form, setForm] = useState({ userId: '', emailAddress: '', firstName: '', lastName: '', password: '', status: 'active' })
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
+  const minLength = usePasswordMinLength()
 
   const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault(); setError(''); setLoading(true)
+    e.preventDefault()
+    // The initial password goes through the same minimum as every later
+    // change; catching it here saves a round trip that would only 400.
+    if (tooShort(form.password, minLength)) { setError(passwordTooShortMessage(minLength as number)); return }
+    setError(''); setLoading(true)
     try {
       await nexusApi.createUser({ ...form })
       onCreated()
@@ -436,7 +600,10 @@ export function CreateUserModal({ onClose, onCreated }: { onClose: () => void; o
         </div>
         <div className={styles.formRow}>
           <label className={styles.label}>Password *</label>
-          <HoloInput type="password" value={form.password} onChange={e => setForm(f => ({ ...f, password: e.target.value }))} required />
+          <HoloInput type="password" value={form.password} onChange={e => setForm(f => ({ ...f, password: e.target.value }))} required autoComplete="new-password" />
+          {minLength !== undefined && (
+            <div style={{ fontSize: 11, color: 'var(--holo-text-faint)' }}>At least {minLength} characters</div>
+          )}
         </div>
         <div className={styles.formGrid}>
           <div className={styles.formRow}>
@@ -450,7 +617,7 @@ export function CreateUserModal({ onClose, onCreated }: { onClose: () => void; o
         </div>
         <div className={styles.formRow}>
           <label className={styles.label}>Email</label>
-          <HoloInput type="email" value={form.email} onChange={e => setForm(f => ({ ...f, email: e.target.value }))} />
+          <HoloInput type="email" value={form.emailAddress} onChange={e => setForm(f => ({ ...f, emailAddress: e.target.value }))} />
         </div>
         <div className={styles.formRow}>
           <label className={styles.label}>Status</label>

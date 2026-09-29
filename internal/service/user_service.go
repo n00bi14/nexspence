@@ -23,6 +23,7 @@ type UserService struct {
 	ldapCfg config.LDAPConfig      // empty when LDAP is disabled
 	oidc    auth.OIDCAuthenticator // nil when OIDC is disabled
 	oidcCfg config.OIDCConfig      // empty when OIDC is disabled
+	groups  auth.GroupLookup       // nil unless a directory lookup (Google Admin SDK) is configured
 	saml    auth.SAMLAuthenticator // nil when SAML is disabled
 	samlCfg config.SAMLConfig      // empty when SAML is disabled
 	log     logger.Logger
@@ -51,6 +52,14 @@ func (s *UserService) WithLDAP(l auth.LDAPAuthenticator, cfg config.LDAPConfig) 
 func (s *UserService) WithOIDC(a auth.OIDCAuthenticator, cfg config.OIDCConfig) *UserService {
 	s.oidc = a
 	s.oidcCfg = cfg
+	return s
+}
+
+// WithGroupLookup attaches a directory lookup that supplies OIDC group
+// membership when the id_token carries none (Google Workspace). When set it
+// is the source of truth for groups on every OIDC login.
+func (s *UserService) WithGroupLookup(l auth.GroupLookup) *UserService {
+	s.groups = l
 	return s
 }
 
@@ -140,14 +149,22 @@ func (s *UserService) loginLDAP(ctx context.Context, username, password string, 
 		return "", nil, fmt.Errorf("%w: user account is not active", ErrInvalidInput)
 	}
 
-	if lu.GroupSearchErr != "" {
-		s.log.Warnw("ldap group search failed", "username", username, "err", lu.GroupSearchErr)
-	}
 	s.log.Infow("ldap user authenticated", "username", username, "ldap_groups", lu.Groups, "user_dn", lu.DN)
 
 	// Best-effort: sync roles from LDAP groups (by name, role_mappings, admin_group).
-	if err := s.syncLDAPRoles(ctx, existing.ID, lu.Groups); err != nil {
-		s.log.Warnw("syncLDAPRoles failed", "username", username, "err", err)
+	// Only a completed search is evidence of membership: a failed search or an
+	// unconfigured one says nothing about the user's groups, so REPLACE would
+	// silently wipe manually-assigned roles (#488).
+	switch {
+	case lu.GroupSearchErr != "":
+		s.log.Warnw("ldap group search failed; leaving existing role assignments untouched",
+			"username", username, "err", lu.GroupSearchErr)
+	case !lu.GroupsSearched:
+		// group_base/group_filter not configured → nothing to sync from.
+	default:
+		if err := s.syncLDAPRoles(ctx, existing.ID, lu.Groups); err != nil {
+			s.log.Warnw("syncLDAPRoles failed", "username", username, "err", err)
+		}
 	}
 
 	// Reload roles so the JWT reflects any just-granted nx-admin role.
@@ -239,10 +256,44 @@ func (s *UserService) GetByID(ctx context.Context, id string) (*domain.User, err
 	return u, nil
 }
 
+// validatePasswordLength rejects a non-empty password below the configured
+// auth.password_min_length. The setting existed in config for ages and was
+// never enforced anywhere — this is the single place that gives it effect.
+// An empty password passes: provisioning paths (SSO JIT, migrated external
+// accounts) deliberately create users with no local credential, and min
+// length 0 means the auth.Service was never wired with a value.
+func (s *UserService) validatePasswordLength(plain string) error {
+	minLen := s.auth.MinPasswordLength()
+	if minLen <= 0 || plain == "" {
+		return nil
+	}
+	if len(plain) < minLen {
+		return fmt.Errorf("%w: must be at least %d characters", ErrPasswordTooShort, minLen)
+	}
+	return nil
+}
+
+// requireLocalPassword checks that a user's credential is actually a local
+// one before a password write. ldap/oidc/saml accounts are re-authenticated
+// by their identity provider — the login flow never compares against the
+// stored hash for them — so a "successful" local password change would be a
+// silent lie. Fail closed here, in the service, so a direct API call cannot
+// bypass it either.
+func (s *UserService) requireLocalPassword(u *domain.User) error {
+	if u.Source != domain.UserSourceLocal {
+		return fmt.Errorf("%w: %s account", ErrPasswordManagedExternally, u.Source)
+	}
+	return nil
+}
+
 // Create persists a new user, hashing plainPassword (if given) and assigning roles.
 func (s *UserService) Create(ctx context.Context, u *domain.User, plainPassword string) error {
 	if u.Username == "" {
 		return fmt.Errorf("%w: username is required", ErrInvalidInput)
+	}
+	// POST/PUT parity: the same minimum the change-password verbs enforce.
+	if err := s.validatePasswordLength(plainPassword); err != nil {
+		return err
 	}
 
 	existing, err := s.users.Get(ctx, u.Username)
@@ -334,7 +385,16 @@ func (s *UserService) ChangePassword(ctx context.Context, username, oldPassword,
 	if err != nil {
 		return err
 	}
+	// Before bcrypt: an ldap/oidc/saml account has an empty local hash, so the
+	// check below would answer the confusing "invalid password" instead of the
+	// truth — the identity provider owns this credential.
+	if err := s.requireLocalPassword(u); err != nil {
+		return err
+	}
 	if err := s.auth.CheckPassword(u.PasswordHash, oldPassword); err != nil {
+		return err
+	}
+	if err := s.validatePasswordLength(newPassword); err != nil {
 		return err
 	}
 	hash, err := s.auth.HashPassword(newPassword)
@@ -355,6 +415,15 @@ func (s *UserService) ChangePassword(ctx context.Context, username, oldPassword,
 func (s *UserService) SetPassword(ctx context.Context, username, newPassword string) error {
 	u, err := s.Get(ctx, username)
 	if err != nil {
+		return err
+	}
+	// Server-side, not just in the UI: resetting an SSO account used to write a
+	// local hash the login flow never checks — the reset "succeeded" and did
+	// nothing. The identity provider owns that credential.
+	if err := s.requireLocalPassword(u); err != nil {
+		return err
+	}
+	if err := s.validatePasswordLength(newPassword); err != nil {
 		return err
 	}
 	hash, err := s.auth.HashPassword(newPassword)
@@ -445,7 +514,20 @@ func (s *UserService) LoginOIDC(ctx context.Context, claims *auth.OIDCClaims, ra
 		return "", nil, fmt.Errorf("%w: user account is not active", ErrInvalidInput)
 	}
 
-	if err := s.syncOIDCRoles(ctx, existing.ID, claims.Groups); err != nil {
+	groups, groupsPresent := claims.Groups, claims.GroupsPresent
+	if s.groups != nil {
+		// The directory, not the token, is the source of truth. A failed
+		// lookup is "no answer": leave roles as they are rather than lock the
+		// user out or wipe what an admin granted (#483).
+		if found, lerr := s.groups.Groups(ctx, email); lerr != nil {
+			s.log.Warnw("oidc group lookup failed; leaving existing role assignments untouched",
+				"username", username, "err", lerr)
+			groups, groupsPresent = nil, false
+		} else {
+			groups, groupsPresent = found, true
+		}
+	}
+	if err := s.syncOIDCRoles(ctx, existing.ID, groups, groupsPresent); err != nil {
 		s.log.Warnw("syncOIDCRoles failed", "username", username, "err", err)
 	}
 
@@ -497,8 +579,19 @@ func (s *UserService) checkProvisioning(email string) error {
 
 // syncOIDCRoles replaces the user's roles with those derived from claims.
 // Collection: admin_group match → nx-admin; role_mappings lookup by claim value
-// (with DN-aware comparison via oidcGroupMatch) → mapped role name.
-func (s *UserService) syncOIDCRoles(ctx context.Context, userID string, groups []string) error {
+// (with DN-aware comparison via oidcGroupMatch) → mapped role name. When the
+// id_token carries no claim under GroupsClaim at all (groupsPresent is
+// false), this is a no-op: the IdP gave no group info for this login, so any
+// manually-assigned roles are left untouched rather than wiped to empty.
+func (s *UserService) syncOIDCRoles(ctx context.Context, userID string, groups []string, groupsPresent bool) error {
+	if !groupsPresent {
+		if s.oidcCfg.GroupsClaim != "" {
+			s.log.Warnw("oidc id_token has no groups claim; leaving existing role assignments untouched",
+				"user", userID, "groups_claim", s.oidcCfg.GroupsClaim)
+		}
+		return nil
+	}
+
 	want := make(map[string]struct{})
 	for _, g := range groups {
 		if s.oidcCfg.AdminGroup != "" && oidcGroupMatch(g, s.oidcCfg.AdminGroup) {
@@ -616,7 +709,7 @@ func (s *UserService) LoginSAML(ctx context.Context, claims *auth.SAMLClaims) (s
 		return "", nil, fmt.Errorf("%w: user account is not active", ErrInvalidInput)
 	}
 
-	if err := s.syncSAMLRoles(ctx, existing.ID, claims.Groups); err != nil {
+	if err := s.syncSAMLRoles(ctx, existing.ID, claims.Groups, claims.GroupsPresent); err != nil {
 		s.log.Warnw("syncSAMLRoles failed", "username", username, "err", err)
 	}
 
@@ -664,8 +757,18 @@ func (s *UserService) checkSAMLProvisioning(email string) error {
 }
 
 // syncSAMLRoles replaces the user's roles derived from SAML groups.
-// REPLACE semantics: IdP is source of truth.
-func (s *UserService) syncSAMLRoles(ctx context.Context, userID string, groups []string) error {
+// REPLACE semantics: IdP is source of truth. When the assertion carries no
+// attribute under GroupsAttribute at all (groupsPresent is false), this is a
+// no-op — see syncOIDCRoles for the same reasoning.
+func (s *UserService) syncSAMLRoles(ctx context.Context, userID string, groups []string, groupsPresent bool) error {
+	if !groupsPresent {
+		if s.samlCfg.GroupsAttribute != "" {
+			s.log.Warnw("saml assertion has no groups attribute; leaving existing role assignments untouched",
+				"user", userID, "groups_attribute", s.samlCfg.GroupsAttribute)
+		}
+		return nil
+	}
+
 	want := make(map[string]struct{})
 	for _, g := range groups {
 		if s.samlCfg.AdminGroup != "" && strings.EqualFold(g, s.samlCfg.AdminGroup) {

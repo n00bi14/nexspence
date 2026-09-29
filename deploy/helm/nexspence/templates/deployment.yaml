@@ -95,7 +95,7 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - name: http
-              containerPort: 8081
+              containerPort: {{ include "nexspence.httpPort" . }}
               protocol: TCP
           env:
             # Pin the trivy (CVE scan) cache to the writable emptyDir below.
@@ -112,6 +112,111 @@ spec:
               value: "true"
             - name: NEXSPENCE_SCAN_TRIVY_BIN
               value: /opt/trivy/trivy
+            {{- with .Values.scanning.dbRepository }}
+            - name: NEXSPENCE_SCAN_TRIVY_DB_REPOSITORY
+              value: {{ . | join "," | quote }}
+            {{- end }}
+            {{- with .Values.scanning.javaDbRepository }}
+            - name: NEXSPENCE_SCAN_TRIVY_JAVA_DB_REPOSITORY
+              value: {{ . | join "," | quote }}
+            {{- end }}
+            {{- end }}
+            {{- if .Values.config.jwtSecretExistingSecret }}
+            - name: NEXSPENCE_AUTH_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.config.jwtSecretExistingSecret }}
+                  key: {{ .Values.config.jwtSecretExistingSecretKey | default "jwt-secret" }}
+            {{- end }}
+            {{- if and .Values.config.bootstrapEnabled .Values.config.adminExistingSecret }}
+            - name: NEXSPENCE_BOOTSTRAP_ADMIN_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.config.adminExistingSecret }}
+                  key: {{ .Values.config.adminExistingSecretUsernameKey | default "admin-username" }}
+            - name: NEXSPENCE_BOOTSTRAP_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.config.adminExistingSecret }}
+                  key: {{ .Values.config.adminExistingSecretPasswordKey | default "admin-password" }}
+            {{- end }}
+            {{- if and (not .Values.postgresql.enabled) .Values.externalDatabase.existingSecret }}
+            - name: NEXSPENCE_DATABASE_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.externalDatabase.existingSecret }}
+                  key: {{ .Values.externalDatabase.existingSecretKey | default "dsn" }}
+            {{- end }}
+            {{- if and (eq .Values.storage.type "s3") .Values.storage.s3.existingSecret }}
+            - name: NEXSPENCE_STORAGE_S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.storage.s3.existingSecret }}
+                  key: {{ .Values.storage.s3.existingSecretAccessKeyKey | default "access-key" }}
+            - name: NEXSPENCE_STORAGE_S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.storage.s3.existingSecret }}
+                  key: {{ .Values.storage.s3.existingSecretSecretKeyKey | default "secret-key" }}
+            {{- end }}
+            {{- if and (eq .Values.storage.type "azure") .Values.storage.azure.existingSecret }}
+            {{- $azKind := .Values.storage.azure.existingSecretKind | default "accountKey" }}
+            {{- if not (or (eq $azKind "accountKey") (eq $azKind "connectionString") (eq $azKind "sasToken")) }}
+            {{- fail (printf "storage.azure.existingSecretKind must be accountKey, connectionString or sasToken, got %q" $azKind) }}
+            {{- end }}
+            {{- if eq $azKind "connectionString" }}
+            - name: NEXSPENCE_STORAGE_AZURE_CONNECTION_STRING
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.storage.azure.existingSecret }}
+                  key: {{ .Values.storage.azure.existingSecretKey | default "connection-string" }}
+            {{- else if eq $azKind "sasToken" }}
+            - name: NEXSPENCE_STORAGE_AZURE_SAS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.storage.azure.existingSecret }}
+                  key: {{ .Values.storage.azure.existingSecretKey | default "sas-token" }}
+            {{- else }}
+            - name: NEXSPENCE_STORAGE_AZURE_ACCOUNT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.storage.azure.existingSecret }}
+                  key: {{ .Values.storage.azure.existingSecretKey | default "account-key" }}
+            {{- end }}
+            {{- end }}
+            {{- if and .Values.redis.enabled .Values.redis.auth.existingSecret }}
+            - name: NEXSPENCE_REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.redis.auth.existingSecret }}
+                  key: {{ .Values.redis.auth.existingSecretKey | default "password" }}
+            {{- else if and .Values.externalRedis.enabled .Values.externalRedis.existingSecret }}
+            - name: NEXSPENCE_REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.externalRedis.existingSecret }}
+                  key: {{ .Values.externalRedis.existingSecretKey | default "password" }}
+            {{- end }}
+            {{- if and .Values.oidc.enabled .Values.oidc.clientSecretExistingSecret }}
+            - name: NEXSPENCE_OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.oidc.clientSecretExistingSecret }}
+                  key: {{ .Values.oidc.clientSecretExistingSecretKey | default "client-secret" }}
+            {{- end }}
+            {{- if and .Values.oidc.enabled .Values.oidc.cookieKeyExistingSecret }}
+            - name: NEXSPENCE_OIDC_COOKIE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.oidc.cookieKeyExistingSecret }}
+                  key: {{ .Values.oidc.cookieKeyExistingSecretKey | default "oidc-cookie-key" }}
+            {{- end }}
+            {{- if and .Values.oidc.enabled .Values.oidc.googleAdminSDK.enabled }}
+            - name: NEXSPENCE_OIDC_GOOGLE_ADMIN_SDK_SERVICE_ACCOUNT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.oidc.googleAdminSDK.serviceAccountKeyExistingSecret }}
+                  key: {{ .Values.oidc.googleAdminSDK.serviceAccountKeyExistingSecretKey | default "key.json" }}
             {{- end }}
             {{- if .Values.postgresql.enabled }}
             # pgx uses PGPASSWORD when the bundled DSN omits userinfo password.
@@ -121,13 +226,6 @@ spec:
                 secretKeyRef:
                   name: {{ include "nexspence.postgresql.secretName" . }}
                   key: {{ include "nexspence.postgresql.secretPasswordKey" . }}
-            {{- end }}
-            {{- if and (not .Values.postgresql.enabled) .Values.externalDatabase.existingSecret }}
-            - name: NEXSPENCE_DATABASE_DSN
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.externalDatabase.existingSecret | quote }}
-                  key: {{ default "dsn" .Values.externalDatabase.existingSecretDsnKey | quote }}
             {{- end }}
           envFrom:
             - configMapRef:
@@ -163,6 +261,9 @@ spec:
               subPath: config.yaml
               readOnly: true
             {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
       volumes:
         # Writable scratch dirs (rootfs is read-only). The trivy cache lives at
         # /app/.cache (HOME=/app, TRIVY_CACHE_DIR=/app/.cache/trivy in the image).
@@ -178,12 +279,15 @@ spec:
         {{- if eq .Values.storage.type "local" }}
         - name: blobs
           persistentVolumeClaim:
-            claimName: {{ include "nexspence.fullname" . }}-blobs
+            claimName: {{ .Values.storage.local.existingClaim | default (printf "%s-blobs" (include "nexspence.fullname" .)) }}
         {{- end }}
         {{- if .Values.scanning.enabled }}
         - name: trivy-bin
           emptyDir:
             sizeLimit: {{ .Values.scanning.volumeSize }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

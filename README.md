@@ -30,7 +30,7 @@
 
 ## What is Nexspence?
 
-Nexspence is a self-hosted artifact repository manager that supports **15 package formats**, three repository types (hosted, proxy, group), fine-grained RBAC, SSO via OIDC/LDAP, audit logging, S3-compatible storage, and a modern dark-theme web UI — all in a single binary backed by PostgreSQL. It exposes the full **Sonatype Nexus v1 REST API** at `/service/rest/v1/` for drop-in compatibility with existing CI/CD pipelines and package manager configs.
+Nexspence is a self-hosted artifact repository manager that supports **19 package formats**, three repository types (hosted, proxy, group), fine-grained RBAC, SSO via OIDC/LDAP, audit logging, S3-compatible storage, and a modern dark-theme web UI — all in a single binary backed by PostgreSQL. It exposes the full **Sonatype Nexus v1 REST API** at `/service/rest/v1/` for drop-in compatibility with existing CI/CD pipelines and package manager configs.
 
 ---
 
@@ -69,7 +69,7 @@ View the full site with interactive architecture diagram, install guide, and com
     <td><img src="website/assets/screenshots/security_roles.PNG" alt="Roles & RBAC" width="480"></td>
   </tr>
   <tr>
-    <td align="center"><em>Blob stores — S3 + local with connection test</em></td>
+    <td align="center"><em>Blob stores — S3, Azure + local with connection test</em></td>
     <td align="center"><em>Roles, privileges, content selectors</em></td>
   </tr>
 </table>
@@ -261,11 +261,15 @@ Published on the [Terraform Registry](https://registry.terraform.io/providers/ne
 | Helm charts | ✓ | ✓ | ✓ |
 | Cargo (Rust) | ✓ | ✓ | ✓ |
 | Raw files | ✓ | ✓ | ✓ |
-| APT (Debian/Ubuntu) | ✓ | ✓ | — |
-| Yum / RPM | ✓ | ✓ | — |
-| Conan (C/C++) | ✓ | ✓ | — |
-| Conda | ✓ | ✓ | — |
-| Terraform Registry | ✓ | ✓ | — |
+| APT (Debian/Ubuntu) | ✓ | ✓ | ✓ |
+| Yum / RPM | ✓ | ✓ | ✓ |
+| Conan (C/C++) | ✓ | ✓ | ✓ |
+| Conda | ✓ | ✓ | ✓ |
+| Terraform Registry | ✓ | ✓ | ✓ |
+| RubyGems | ✓ | ✓ | — |
+| R / CRAN | ✓ | ✓ | ✓ |
+| Alpine (apk) | ✓ | ✓ | ✓ |
+| Hugging Face (models, datasets, spaces) | ✓ | ✓ | ✓ |
 
 ---
 
@@ -290,7 +294,7 @@ Published on the [Terraform Registry](https://registry.terraform.io/providers/ne
 - RBAC — Roles, Privileges, Content Selectors (CEL expressions)
 
 **Storage**
-- Local filesystem (default) or S3-compatible (AWS S3, MinIO, Ceph)
+- Local filesystem (default), S3-compatible (AWS S3, MinIO, Ceph), or Azure Blob Storage
 - Per-repository blob store routing; blob store groups (round-robin / write-to-first)
 - Storage quotas per blob store and per repository
 
@@ -330,9 +334,9 @@ The Helm chart reference ships with the chart itself: [`deploy/helm/nexspence/RE
 | 64–67 | Landing page, in-app docs, security hardening | ✓ complete |
 | 68 | Extended monitoring — Prometheus endpoint, Grafana dashboard, UI Charts tab | ✓ complete |
 | 69 | Blob GC — age-gated orphan collection, global cron scheduler, UI panel | ✓ complete |
+| 70 | OpenTelemetry tracing — spans across API, proxy and background jobs, trace_id in structured logs | ✓ complete |
 | CLI | [`nxs` CLI](https://github.com/nexspence/nxs) — terminal & CI/CD client, v0.1.0 | ✓ complete |
 | next | SBOM generation, cosign image signing | planned |
-| next | OpenTelemetry traces | planned |
 
 ---
 

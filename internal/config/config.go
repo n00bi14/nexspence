@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"reflect"
 	"strings"
 	"time"
 
+	"github.com/go-viper/mapstructure/v2"
 	"github.com/spf13/viper"
 )
 
@@ -26,8 +28,10 @@ type Config struct {
 	Cleanup   CleanupConfig   `mapstructure:"cleanup"`
 	GC        GCConfig        `mapstructure:"gc"`
 	Scan      ScanConfig      `mapstructure:"scan"`
+	Promotion PromotionConfig `mapstructure:"promotion"`
 	Audit     AuditConfig     `mapstructure:"audit"`
 	Docker    DockerConfig    `mapstructure:"docker"`
+	Helm      HelmConfig      `mapstructure:"helm"`
 	Redis     RedisConfig     `mapstructure:"redis"`
 	Proxy     ProxyConfig     `mapstructure:"proxy"`
 	Outbound  OutboundConfig  `mapstructure:"outbound"`
@@ -150,12 +154,13 @@ type DatabaseConfig struct {
 	MaxIdleSec int    `mapstructure:"max_idle_sec"`
 }
 
-// StorageConfig selects the default blob store backend and its local/S3 settings.
+// StorageConfig selects the default blob store backend and its local/S3/Azure settings.
 type StorageConfig struct {
-	// Default blob store type: "local" or "s3"
+	// Default blob store type: "local", "s3" or "azure"
 	DefaultType string      `mapstructure:"default_type"`
 	Local       LocalConfig `mapstructure:"local"`
 	S3          S3Config    `mapstructure:"s3"`
+	Azure       AzureConfig `mapstructure:"azure"`
 }
 
 // LocalConfig holds the base path for the local filesystem blob store.
@@ -173,6 +178,22 @@ type S3Config struct {
 	ForcePathStyle  bool   `mapstructure:"force_path_style"`
 	// SkipTLSVerify disables certificate verification against the endpoint,
 	// for an on-prem S3 fronted by a private CA (#403). Off by default.
+	SkipTLSVerify bool `mapstructure:"skip_tls_verify"`
+}
+
+// AzureConfig holds credentials and endpoint settings for the Azure Blob
+// Storage backend. Exactly one credential path is required: ConnectionString,
+// AccountKey (with AccountName), SASToken, or an ambient Entra ID identity
+// via DefaultAzureCredential (which still needs AccountName).
+type AzureConfig struct {
+	Container        string `mapstructure:"container"`
+	AccountName      string `mapstructure:"account_name"`
+	AccountKey       string `mapstructure:"account_key"`
+	ConnectionString string `mapstructure:"connection_string"`
+	SASToken         string `mapstructure:"sas_token"`
+	Endpoint         string `mapstructure:"endpoint"`
+	// SkipTLSVerify mirrors the S3 option of the same name for an
+	// endpoint behind a private CA. Off by default.
 	SkipTLSVerify bool `mapstructure:"skip_tls_verify"`
 }
 
@@ -255,6 +276,11 @@ type OIDCConfig struct {
 	AdminGroup   string            `mapstructure:"admin_group"`   // claim value → nx-admin
 	RoleMappings map[string]string `mapstructure:"role_mappings"` // claim value → Nexspence role name
 
+	// GoogleAdminSDK looks group membership up in the Workspace directory,
+	// since a Google id_token never carries a groups claim. Group emails
+	// then flow through admin_group / role_mappings like a claim would.
+	GoogleAdminSDK GoogleAdminSDKConfig `mapstructure:"google_admin_sdk"`
+
 	// Claim name overrides (provider-specific).
 	UsernameClaim string `mapstructure:"username_claim"`
 	EmailClaim    string `mapstructure:"email_claim"`
@@ -271,6 +297,16 @@ type OIDCConfig struct {
 	// in Docker: internal=http://keycloak:8080/realms/x, public=http://localhost:8180/realms/x).
 	// Token validation always uses the internal Issuer so iss-claim checks still pass.
 	PublicIssuerURL string `mapstructure:"public_issuer_url"`
+}
+
+// GoogleAdminSDKConfig configures Admin SDK Directory API group lookups for
+// Google Workspace OIDC logins (#483). The service account needs domain-wide
+// delegation for admin.directory.group.readonly and impersonates SubjectEmail.
+type GoogleAdminSDKConfig struct {
+	Enabled               bool   `mapstructure:"enabled"`
+	ServiceAccountKey     string `mapstructure:"service_account_key"`      // JSON key, inline (env/secret friendly)
+	ServiceAccountKeyFile string `mapstructure:"service_account_key_file"` // or a path; inline wins when both set
+	SubjectEmail          string `mapstructure:"subject_email"`            // Workspace user to impersonate
 }
 
 const exampleJWTSecret = "CHANGE_ME_AT_LEAST_32_CHARACTERS_LONG" //nolint:gosec // G101 false positive: this is the known-bad placeholder string we reject at startup, not an actual credential
@@ -307,6 +343,19 @@ func (a AuthConfig) EncryptionKeyBytes() []byte {
 		return nil
 	}
 	return b
+}
+
+// ValidateStorage rejects an unknown storage.default_type. Viper has no notion
+// of an enum, so a typo ("S3", "azue") used to fall through to the local
+// backend and every push landed on a container filesystem nobody was watching —
+// with the configured bucket or container sitting there empty.
+func ValidateStorage(s StorageConfig) error {
+	switch s.DefaultType {
+	case "", "local", "s3", "azure":
+		return nil
+	default:
+		return fmt.Errorf("storage.default_type must be \"local\", \"s3\" or \"azure\", got %q", s.DefaultType)
+	}
 }
 
 // ValidateAuth rejects an empty, placeholder, or too-short JWT signing secret.
@@ -350,6 +399,14 @@ func ValidateOIDC(c OIDCConfig) error {
 	keyBytes, err := base64.StdEncoding.DecodeString(c.CookieKey)
 	if err != nil || len(keyBytes) != 32 {
 		return fmt.Errorf("oidc.cookie_key must be base64-encoded 32 bytes")
+	}
+	if g := c.GoogleAdminSDK; g.Enabled {
+		if g.SubjectEmail == "" {
+			return fmt.Errorf("oidc.google_admin_sdk.subject_email is required when oidc.google_admin_sdk.enabled=true")
+		}
+		if g.ServiceAccountKey == "" && g.ServiceAccountKeyFile == "" {
+			return fmt.Errorf("oidc.google_admin_sdk.service_account_key or service_account_key_file is required when oidc.google_admin_sdk.enabled=true")
+		}
 	}
 	return nil
 }
@@ -424,6 +481,22 @@ type CleanupConfig struct {
 	DefaultSchedule string `mapstructure:"default_schedule"`
 }
 
+// PromotionConfig tunes automatic promotion on publish (#542), which each
+// promotion rule turns on with auto_promote. The worker runs on every replica;
+// the queue it drains is shared through the database.
+type PromotionConfig struct {
+	// AutoSettleWindow is how long a published component must go without a
+	// new asset before an auto-promoting rule evaluates it, so a multi-file
+	// upload (Maven jar+pom+sources, several wheels) is promoted once, whole.
+	AutoSettleWindow time.Duration `mapstructure:"auto_settle_window"`
+	// AutoScanWait is how long a rule with require_scan_pass waits for a scan
+	// of the publish before the automatic promotion is recorded as blocked.
+	AutoScanWait time.Duration `mapstructure:"auto_scan_wait"`
+	// AutoPollInterval is how often the worker looks for components due for
+	// evaluation.
+	AutoPollInterval time.Duration `mapstructure:"auto_poll_interval"`
+}
+
 // GCConfig configures scheduled blob garbage collection.
 type GCConfig struct {
 	Enabled  bool          `mapstructure:"enabled"`
@@ -483,6 +556,21 @@ type DockerConfig struct {
 	MaxUploadBytes int64 `mapstructure:"max_upload_bytes"`
 }
 
+// HelmConfig holds Helm-specific settings.
+type HelmConfig struct {
+	// IndexCacheTTL is how long a Helm proxy reuses an upstream index.yaml it
+	// already fetched when resolving where a chart tarball comes from. Every
+	// uncached .tgz needs that lookup, so without it the first pull through a
+	// group costs one index download per proxy member — and an index like
+	// Bitnami's is tens of megabytes. A published chart version never changes
+	// its URL, so the window only delays charts published upstream within it.
+	// 0 disables the cache and fetches the index per request.
+	//
+	// The index served to clients at /index.yaml is never cached: the catalog a
+	// client searches must not lag behind upstream.
+	IndexCacheTTL time.Duration `mapstructure:"index_cache_ttl"`
+}
+
 // SubdomainConnectorConfig configures per-repository Docker subdomain routing.
 //
 // Aliases decouple the client-facing hostname from the repository name (#282):
@@ -533,6 +621,13 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("storage.s3.secret_access_key", "")
 	v.SetDefault("storage.s3.force_path_style", false)
 	v.SetDefault("storage.s3.skip_tls_verify", false)
+	v.SetDefault("storage.azure.container", "")
+	v.SetDefault("storage.azure.account_name", "")
+	v.SetDefault("storage.azure.account_key", "")
+	v.SetDefault("storage.azure.connection_string", "")
+	v.SetDefault("storage.azure.sas_token", "")
+	v.SetDefault("storage.azure.endpoint", "")
+	v.SetDefault("storage.azure.skip_tls_verify", false)
 	v.SetDefault("database.max_conns", 100)
 	v.SetDefault("database.min_conns", 5)
 	v.SetDefault("database.max_idle_sec", 300)
@@ -569,6 +664,9 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("scan.trivy.java_db_repository", []string{})
 	v.SetDefault("scan.trivy.skip_db_update", false)
 	v.SetDefault("scan.trivy.cache_dir", "")
+	v.SetDefault("promotion.auto_settle_window", "30s")
+	v.SetDefault("promotion.auto_scan_wait", "1h")
+	v.SetDefault("promotion.auto_poll_interval", "5s")
 	v.SetDefault("audit.retention_days", 90)
 	v.SetDefault("audit.soft_cap", int64(1_000_000))
 	v.SetDefault("audit.rotation_interval", "24h")
@@ -576,8 +674,18 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("docker.subdomain_connector.enabled", false)
 	v.SetDefault("docker.subdomain_connector.base_domain", "")
 	v.SetDefault("docker.max_upload_bytes", int64(10<<30)) // 10 GiB
+	v.SetDefault("helm.index_cache_ttl", "5m")
 	v.SetDefault("oidc.enabled", false)
 	v.SetDefault("oidc.display_name", "SSO")
+	// Zero-value defaults so these stay reachable from the environment when
+	// no config file is present (same viper caveat as database.dsn above).
+	v.SetDefault("oidc.issuer", "")
+	v.SetDefault("oidc.client_id", "")
+	v.SetDefault("oidc.client_secret", "")
+	v.SetDefault("oidc.redirect_url", "")
+	v.SetDefault("oidc.frontend_base_url", "")
+	v.SetDefault("oidc.admin_group", "")
+	v.SetDefault("oidc.cookie_key", "")
 	v.SetDefault("oidc.public_issuer_url", "")
 	v.SetDefault("oidc.scopes", []string{"openid", "profile", "email", "groups"})
 	v.SetDefault("oidc.provisioning", "jit")
@@ -588,6 +696,10 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("oidc.show_login_button", true)
 	v.SetDefault("oidc.cookie_secure", true)
 	v.SetDefault("oidc.allowed_skew_seconds", 60)
+	v.SetDefault("oidc.google_admin_sdk.enabled", false)
+	v.SetDefault("oidc.google_admin_sdk.service_account_key", "")
+	v.SetDefault("oidc.google_admin_sdk.service_account_key_file", "")
+	v.SetDefault("oidc.google_admin_sdk.subject_email", "")
 	v.SetDefault("saml.enabled", false)
 	v.SetDefault("saml.display_name", "SAML SSO")
 	v.SetDefault("saml.show_login_button", true)
@@ -620,6 +732,7 @@ func Load(path string) (*Config, error) {
 	v.SetDefault("tracing.environment", "")
 	v.SetDefault("redis.enabled", false)
 	v.SetDefault("redis.addr", "localhost:6379")
+	v.SetDefault("redis.password", "")
 	v.SetDefault("redis.db", 0)
 
 	// Config file
@@ -629,6 +742,12 @@ func Load(path string) (*Config, error) {
 	// Env override: NEXSPENCE_DATABASE_DSN, NEXSPENCE_AUTH_JWT_SECRET, etc.
 	v.SetEnvPrefix("NEXSPENCE")
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	// Without this, viper treats an env var set to "" as unset, so an operator
+	// blanking a key that has a non-empty default (oidc.groups_claim is
+	// "groups") silently keeps the default — with no error and no way to tell
+	// from the outside (#482). Only variables that are genuinely present in
+	// the environment are affected; an absent one still yields the default.
+	v.AllowEmptyEnv(true)
 	v.AutomaticEnv()
 
 	if err := v.ReadInConfig(); err != nil {
@@ -642,12 +761,26 @@ func Load(path string) (*Config, error) {
 	}
 
 	var cfg Config
-	if err := v.Unmarshal(&cfg); err != nil {
+	// Viper's key delimiter is ".". Hostname keys in
+	// docker.subdomain_connector.aliases (docker-hub-proxy.example.com) are
+	// therefore split into nested maps, and Unmarshal into map[string]string
+	// fails with: aliases[docker-hub-proxy] expected string, got map.
+	// Quoting the YAML key does not help — the split happens after parse.
+	// Flatten those nested maps back into dotted hostnames. Passing DecodeHook
+	// replaces viper's defaults, so keep the duration and comma-slice hooks.
+	if err := v.Unmarshal(&cfg, viper.DecodeHook(mapstructure.ComposeDecodeHookFunc(
+		mapstructure.StringToTimeDurationHookFunc(),
+		mapstructure.StringToSliceHookFunc(","),
+		flattenDottedStringMapHook(),
+	))); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 
 	if cfg.Database.DSN == "" {
 		return nil, fmt.Errorf("database.dsn is required (or set NEXSPENCE_DATABASE_DSN)")
+	}
+	if err := ValidateStorage(cfg.Storage); err != nil {
+		return nil, err
 	}
 	if err := ValidateAuth(cfg.Auth); err != nil {
 		return nil, err
@@ -671,4 +804,92 @@ func Load(path string) (*Config, error) {
 	}
 
 	return &cfg, nil
+}
+
+// flattenDottedStringMapHook rebuilds map[string]string keys that viper split
+// on ".". It only runs when unmarshalling into map[string]string.
+func flattenDottedStringMapHook() mapstructure.DecodeHookFunc {
+	return func(_ reflect.Type, to reflect.Type, data any) (any, error) {
+		if to.Kind() != reflect.Map || to.Key().Kind() != reflect.String || to.Elem().Kind() != reflect.String {
+			return data, nil
+		}
+		flat, ok, err := flattenStringMap(data, "")
+		if err != nil || !ok {
+			return data, err
+		}
+		return flat, nil
+	}
+}
+
+func flattenStringMap(data any, prefix string) (map[string]string, bool, error) {
+	switch m := data.(type) {
+	case map[string]string:
+		if prefix == "" {
+			return m, true, nil
+		}
+		out := make(map[string]string, len(m))
+		for k, v := range m {
+			out[joinDotted(prefix, k)] = v
+		}
+		return out, true, nil
+	case map[string]any:
+		out := map[string]string{}
+		for k, v := range m {
+			if err := mergeFlattened(out, joinDotted(prefix, k), v); err != nil {
+				return nil, false, err
+			}
+		}
+		return out, true, nil
+	case map[any]any:
+		out := map[string]string{}
+		for k, v := range m {
+			ks, ok := k.(string)
+			if !ok {
+				return nil, false, fmt.Errorf("expected string map key, got %T", k)
+			}
+			if err := mergeFlattened(out, joinDotted(prefix, ks), v); err != nil {
+				return nil, false, err
+			}
+		}
+		return out, true, nil
+	default:
+		return nil, false, nil
+	}
+}
+
+func mergeFlattened(out map[string]string, key string, v any) error {
+	switch child := v.(type) {
+	case string:
+		out[key] = child
+	case map[string]any:
+		for ck, cv := range child {
+			if err := mergeFlattened(out, joinDotted(key, ck), cv); err != nil {
+				return err
+			}
+		}
+	case map[string]string:
+		for ck, cv := range child {
+			out[joinDotted(key, ck)] = cv
+		}
+	case map[any]any:
+		for ck, cv := range child {
+			ks, ok := ck.(string)
+			if !ok {
+				return fmt.Errorf("%s: expected string map key, got %T", key, ck)
+			}
+			if err := mergeFlattened(out, joinDotted(key, ks), cv); err != nil {
+				return err
+			}
+		}
+	default:
+		return fmt.Errorf("%s: expected string, got %T", key, v)
+	}
+	return nil
+}
+
+func joinDotted(prefix, key string) string {
+	if prefix == "" {
+		return key
+	}
+	return prefix + "." + key
 }

@@ -248,6 +248,27 @@ func (h *Handler) collectTags(ctx context.Context, repoName, imageName string) (
 
 // ─── Manifests ─────────────────────────────────────────────────────────────
 
+// unauthorizedAsNotFound maps an upstream 401 to 404 so group first-non-404
+// fan-out continues. Docker Hub answers a name it does not host with 401
+// insufficient_scope. 403 stays 403: on this protocol that status is a refusal,
+// not "some other registry has the blob".
+type unauthorizedAsNotFound struct{ gin.ResponseWriter }
+
+func (w unauthorizedAsNotFound) WriteHeader(code int) {
+	if code == http.StatusUnauthorized {
+		code = http.StatusNotFound
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+// maskUpstreamAuthMiss installs unauthorizedAsNotFound while a group is
+// walking members. A request addressed at the member itself is left alone.
+func maskUpstreamAuthMiss(c *gin.Context) {
+	if c.GetBool(formats.GroupMemberKey) {
+		c.Writer = unauthorizedAsNotFound{ResponseWriter: c.Writer}
+	}
+}
+
 func (h *Handler) handleManifests(c *gin.Context, repoName, imageName, reference string) {
 	repo, _ := h.deps.Repos.Get(c.Request.Context(), repoName)
 	switch c.Request.Method {
@@ -264,6 +285,12 @@ func (h *Handler) handleManifests(c *gin.Context, repoName, imageName, reference
 			if !strings.HasPrefix(reference, "sha256:") {
 				maxAge = repoproxy.MetadataMaxAge(repo)
 			}
+			// A registry that does not host this image often answers 401
+			// (Docker Hub insufficient_scope) rather than 404. During group
+			// fan-out that is a miss: the next member may hold it. A direct
+			// pull keeps the 401, so a wrong upstream credential is not
+			// reported as "no such image".
+			maskUpstreamAuthMiss(c)
 			if err := repoproxy.ServeGET(c, h.deps, repo, cachePath, upPath, coords, ct, maxAge); err != nil {
 				dockerError(c, http.StatusBadGateway, "UNKNOWN", err.Error())
 				return
@@ -356,7 +383,7 @@ func (h *Handler) pushManifest(c *gin.Context, repoName, imageName, reference st
 		repoName, fp, ct, coords,
 		bytes.NewReader(body), int64(len(body)))
 	if err != nil {
-		dockerError(c, http.StatusInternalServerError, "UNKNOWN", err.Error())
+		storeError(c, err)
 		return
 	}
 
@@ -422,9 +449,15 @@ func (h *Handler) recordCachedManifestMeta(ctx context.Context, repo *domain.Rep
 
 	store := h.deps.BlobStore
 	if asset.BlobStoreID != "" {
-		if bsMeta, getErr := h.deps.Blobs.GetByID(ctx, asset.BlobStoreID); getErr == nil {
-			store = base.PhysicalStore(ctx, h.deps, bsMeta)
+		bsMeta, getErr := h.deps.Blobs.GetByID(ctx, asset.BlobStoreID)
+		if getErr != nil || bsMeta == nil {
+			return
 		}
+		resolved, resolveErr := base.PhysicalStore(ctx, h.deps, bsMeta)
+		if resolveErr != nil {
+			return
+		}
+		store = resolved
 	}
 	rc, _, err := store.Get(ctx, asset.BlobKey)
 	if err != nil {
@@ -490,6 +523,10 @@ func (h *Handler) handleBlobs(c *gin.Context, repoName, imageName, digest string
 			upPath := "/v2/" + imageName + "/blobs/" + digest
 			coords := base.Coords{Name: imageName, Version: digest}
 			// Blobs are content-addressed by digest — immutable, never revalidate.
+			// Same 401-as-miss rule as manifests: a group pull fetches layers
+			// through the group too, and the member that 401s on the manifest
+			// 401s on the blob.
+			maskUpstreamAuthMiss(c)
 			if err := repoproxy.ServeGET(c, h.deps, repo, cachePath, upPath, coords, "application/octet-stream", 0); err != nil {
 				dockerError(c, http.StatusBadGateway, "UNKNOWN", err.Error())
 			}
@@ -586,6 +623,16 @@ func (h *Handler) initiateUpload(c *gin.Context, repoName, imageName string) {
 	if !requireDockerAuth(c) {
 		return
 	}
+	// A read-only repository refuses the push up front (#539): the mount below
+	// registers an asset without going through StoreArtifact, and an upload
+	// session would only be refused at the final PUT after the client sent
+	// every byte of the layer.
+	if repo, err := h.deps.Repos.Get(c.Request.Context(), repoName); err == nil && repo != nil {
+		if werr := base.CheckWritable(repo); werr != nil {
+			storeError(c, werr)
+			return
+		}
+	}
 	// Cross-repository blob mount: ?mount=<digest>&from=<name>. When it cannot be
 	// served the request falls through to a normal upload session, which the spec
 	// explicitly allows and which costs the client only the bandwidth it would
@@ -673,17 +720,14 @@ func (h *Handler) mountBlob(c *gin.Context, repoName, imageName, dgst, from stri
 			// An asset row outlives its bytes: a manual blob delete or a GC pass
 			// can leave the record behind. Answering 201 off one of those would
 			// hand the client a layer that 404s on pull.
-			storeName, present := h.locateBlob(ctx, src)
+			storeName, present, locateErr := h.locateBlob(ctx, src)
+			if locateErr != nil {
+				return locateErr
+			}
 			if !present {
 				return nil
 			}
 			blobStoreID := src.BlobStoreID
-			if storeName == "" {
-				// The store the source names could not be resolved, so let the
-				// registration fall back to the repository's own default, exactly as
-				// a fetch of that asset would.
-				blobStoreID = ""
-			}
 			if _, err := base.RegisterStoredBlob(ctx, h.deps, repo,
 				blobPath(imageName, dgst), "application/octet-stream",
 				base.Coords{Name: imageName, Version: dgst},
@@ -694,6 +738,10 @@ func (h *Handler) mountBlob(c *gin.Context, repoName, imageName, dgst, from stri
 			mounted = true
 			return nil
 		}); lockErr != nil {
+			if errors.Is(lockErr, base.ErrBlobStoreUnavailable) {
+				dockerError(c, http.StatusInternalServerError, "UNKNOWN", lockErr.Error())
+				return true
+			}
 			return false
 		}
 		if !mounted {
@@ -765,21 +813,36 @@ func mountSourceImages(repoName, from string) []string {
 }
 
 // locateBlob reports whether an asset's bytes are really in the store, and
-// returns the name of the store holding them (empty when the asset names no
-// store, or names one that no longer resolves).
-func (h *Handler) locateBlob(ctx context.Context, asset *domain.Asset) (storeName string, present bool) {
+// returns the name of the store holding them. A store id is a hard location:
+// lookup, initialization, and existence-check errors are returned so a failed
+// source store cannot turn a mount into a write against a different store.
+func (h *Handler) locateBlob(ctx context.Context, asset *domain.Asset) (storeName string, present bool, err error) {
 	store := h.deps.BlobStore
 	if asset.BlobStoreID != "" {
-		if meta, err := h.deps.Blobs.GetByID(ctx, asset.BlobStoreID); err == nil && meta != nil {
-			store = base.PhysicalStore(ctx, h.deps, meta)
-			storeName = meta.Name
+		meta, getErr := h.deps.Blobs.GetByID(ctx, asset.BlobStoreID)
+		if getErr != nil {
+			return "", false, fmt.Errorf("%w: asset blob store %q: %w", base.ErrBlobStoreUnavailable, asset.BlobStoreID, getErr)
 		}
+		if meta == nil {
+			return "", false, fmt.Errorf("%w: asset blob store id %q not found", base.ErrBlobStoreUnavailable, asset.BlobStoreID)
+		}
+		store, err = base.PhysicalStore(ctx, h.deps, meta)
+		if err != nil {
+			return "", false, fmt.Errorf("%w: %w", base.ErrBlobStoreUnavailable, err)
+		}
+		storeName = meta.Name
 	}
 	exists, err := store.Exists(ctx, asset.BlobKey)
-	if err != nil || !exists {
-		return "", false
+	if err != nil {
+		if asset.BlobStoreID != "" {
+			return "", false, fmt.Errorf("%w: check asset blob %q: %w", base.ErrBlobStoreUnavailable, asset.BlobKey, err)
+		}
+		return "", false, err
 	}
-	return storeName, true
+	if !exists {
+		return "", false, nil
+	}
+	return storeName, true, nil
 }
 
 // blobLocation is the URL of a stored blob under the same /v2/ prefix — and the
@@ -908,7 +971,7 @@ func (h *Handler) finalizeUpload(c *gin.Context, repoName, imageName, uuid strin
 	if _, err := base.StoreArtifact(c.Request.Context(), h.deps,
 		repoName, fp, "application/octet-stream", coords,
 		body, size); err != nil {
-		dockerError(c, http.StatusInternalServerError, "UNKNOWN", err.Error())
+		storeError(c, err)
 		return
 	}
 	// Delete session only after successful store — allows retry on failure.
@@ -969,6 +1032,21 @@ func digestMismatchStream(claimed string, r io.Reader) (string, error) {
 		return fmt.Sprintf("digest %s does not match content sha256:%s", claimed, actual), nil
 	}
 	return "", nil
+}
+
+// storeError answers a failed base.StoreArtifact in the registry's error
+// format. A write the repository's write policy refuses (#539) is DENIED —
+// the spec's code for "the requested access to the resource is denied" — at
+// 400, the status Nexus answers a Docker redeploy with; docker prints the
+// message, which names the repository. Anything else keeps UNKNOWN at the
+// status base.HTTPStatusForError picks.
+func storeError(c *gin.Context, err error) {
+	status := base.HTTPStatusForError(err)
+	if errors.Is(err, base.ErrRedeployDenied) || errors.Is(err, base.ErrRepositoryReadOnly) {
+		dockerError(c, status, "DENIED", err.Error())
+		return
+	}
+	dockerError(c, status, "UNKNOWN", err.Error())
 }
 
 func dockerError(c *gin.Context, status int, code, message string) {
