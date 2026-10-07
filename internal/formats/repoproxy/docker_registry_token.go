@@ -227,7 +227,7 @@ func fetchDockerRegistryToken(ctx context.Context, repo *domain.Repository, clie
 	req.Header.Set("User-Agent", "Nexspence/1.0 (docker-proxy)")
 	SetUpstreamAuth(req, repo)
 
-	resp, err := client.Do(req)
+	resp, err := tokenRedirectClient(client).Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -237,7 +237,7 @@ func fetchDockerRegistryToken(ctx context.Context, repo *domain.Repository, clie
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		return "", &tokenEndpointError{
 			status:          resp.StatusCode,
-			withCredentials: req.Header.Get("Authorization") != "",
+			withCredentials: resp.Request.Header.Get("Authorization") != "",
 		}
 	}
 
