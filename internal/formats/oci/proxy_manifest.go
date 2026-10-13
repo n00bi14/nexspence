@@ -78,7 +78,9 @@ func (h *Handler) proxyManifestLocked(ctx context.Context, c *gin.Context, repo 
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusNotModified && compatible {
 		if err := h.deps.Assets.TouchLastModified(ctx, cached.ID); err != nil {
-			return fmt.Errorf("refresh manifest: %w", err)
+			// The verified bytes remain valid; leave freshness stale so the next
+			// request can revalidate again if the timestamp update failed.
+			repoproxy.LogCacheRefreshError(ctx, repo.Name, cached.Path, err)
 		}
 		h.respondManifest(c, repo, image, ref, cached, body)
 		return nil
