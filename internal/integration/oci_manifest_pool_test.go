@@ -28,9 +28,10 @@ import (
 
 func TestProxyOCI_ManifestSmallPool_RealShape(t *testing.T) {
 	for _, tc := range []struct {
-		name                           string
-		parallel, mixed, shared, quota bool
+		name                                    string
+		parallel, mixed, shared, quota, blocked bool
 	}{
+		{name: "blocked_upstream", parallel: true, mixed: true, blocked: true},
 		{name: "single"}, {name: "same", parallel: true}, {name: "different", parallel: true, mixed: true},
 		{name: "shared_digest_quota", parallel: true, mixed: true, shared: true, quota: true},
 		{name: "same_quota", parallel: true, quota: true}, {name: "different_quota", parallel: true, mixed: true, quota: true},
@@ -50,13 +51,25 @@ func TestProxyOCI_ManifestSmallPool_RealShape(t *testing.T) {
 				return bodyFor(ref)
 			}
 			var swapped atomic.Bool
+			entered := make(chan struct{}, 32)
+			release := make(chan struct{})
+			var unblock sync.Once
+			defer unblock.Do(func() { close(release) })
 			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				ref, ok := strings.CutPrefix(r.URL.Path, "/v2/library/test/manifests/")
 				if !ok || strings.Contains(ref, ":") {
 					http.NotFound(w, r)
 					return
 				}
-				// Keep the first lock holder active while concurrent pulls start.
+				if tc.blocked && !swapped.Load() {
+					entered <- struct{}{}
+					select {
+					case <-release:
+					case <-r.Context().Done():
+						return
+					}
+				}
+				// Model a slow registry while concurrent pulls start.
 				if ref == "one" && swapped.Load() {
 					ref = "new"
 				}
@@ -82,6 +95,7 @@ func TestProxyOCI_ManifestSmallPool_RealShape(t *testing.T) {
 			require.NoError(t, repos.Create(ctx, repo))
 			t.Cleanup(func() { require.NoError(t, repos.Delete(ctx, name)); require.NoError(t, blobs.Delete(ctx, name)) })
 			var urls []string
+			var pools []*pgxpool.Pool
 			// Independent routers and pools share only PostgreSQL and physical storage.
 			for range 2 {
 				pc := pool.Config().Copy()
@@ -90,6 +104,7 @@ func TestProxyOCI_ManifestSmallPool_RealShape(t *testing.T) {
 				small, err := pgxpool.NewWithConfig(ctx, pc)
 				require.NoError(t, err)
 				t.Cleanup(small.Close)
+				pools = append(pools, small)
 				cfg := &config.Config{}
 				cfg.Auth.JWTSecret = "integration-test-secret-32bytes!!"
 				cfg.Auth.JWTExpiryHours = 1
@@ -151,6 +166,26 @@ func TestProxyOCI_ManifestSmallPool_RealShape(t *testing.T) {
 				})
 			}
 			close(start)
+			if tc.blocked {
+				// Both instances must reach the blocked registry without retaining
+				// either connection of their deliberately small PostgreSQL pools.
+				for range 4 {
+					select {
+					case <-entered:
+					case <-time.After(2 * time.Second):
+						t.Fatal("manifest pulls did not reach upstream")
+					}
+				}
+				for _, small := range pools {
+					queryCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+					var one int
+					err := small.QueryRow(queryCtx, "SELECT 1").Scan(&one)
+					cancel()
+					require.NoError(t, err, "blocked upstream must not monopolize the DB pool")
+					require.Equal(t, 1, one)
+				}
+				unblock.Do(func() { close(release) })
+			}
 			wg.Wait()
 			close(results)
 			for err := range results {

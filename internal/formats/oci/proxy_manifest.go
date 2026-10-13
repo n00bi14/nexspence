@@ -29,27 +29,27 @@ func (h *Handler) proxyManifest(c *gin.Context, repo *domain.Repository, image, 
 		dockerError(c, http.StatusBadRequest, "DIGEST_INVALID", "invalid manifest digest")
 		return nil
 	}
-	return h.deps.Assets.WithBlobKeyLock(c.Request.Context(), "oci:manifest:"+repo.Name+":"+manifestPath(image, ref), func(ctx context.Context) error {
-		// Pull gates also query through the request context. Keep every read
-		// inside the lock scope on the same database connection.
-		request := c.Request
-		c.Request = request.WithContext(ctx)
-		defer func() { c.Request = request }()
-		return h.proxyManifestLocked(ctx, c, repo, image, ref)
+	ctx := c.Request.Context()
+	var cached *domain.Asset
+	var body []byte
+	var repairErr error
+	err := h.withManifestLock(ctx, repo, image, ref, func(ctx context.Context) error {
+		var err error
+		cached, body, err = h.cachedManifest(ctx, repo.Name, manifestPath(image, ref), true)
+		if err != nil {
+			return err
+		}
+		if cached != nil && !strings.Contains(ref, ":") {
+			_, repairErr = h.persistManifest(ctx, repo, image, ref, cached.ContentType, body, cached)
+		}
+		return nil
 	})
-}
-
-func (h *Handler) proxyManifestLocked(ctx context.Context, c *gin.Context, repo *domain.Repository, image, ref string) error {
-	cached, body, err := h.cachedManifest(ctx, repo.Name, manifestPath(image, ref), true)
 	if err != nil {
 		return err
 	}
-	// Repair legacy tag aliases even when Accept requires a different variant.
-	// Otherwise a subsequent tag replacement could strand already served bytes.
-	if cached != nil && !strings.Contains(ref, ":") {
-		if _, err = h.persistManifest(ctx, repo, image, ref, cached.ContentType, body, cached); err != nil && !h.manifestAvailableUpstream(ctx, repo, image, cached.ContentType, body) {
-			return err
-		}
+	// Network verification must not retain an advisory-lock connection.
+	if repairErr != nil && !h.manifestAvailableUpstream(ctx, repo, image, cached.ContentType, body) {
+		return repairErr
 	}
 	compatible := cached != nil && acceptsManifest(manifestAccept(c), cached.ContentType)
 	if cached != nil && strings.Contains(ref, ":") && !compatible {
@@ -77,7 +77,17 @@ func (h *Handler) proxyManifestLocked(ctx context.Context, c *gin.Context, repo 
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusNotModified && compatible {
-		if err := h.deps.Assets.TouchLastModified(ctx, cached.ID); err != nil {
+		if err := h.withManifestLock(ctx, repo, image, ref, func(ctx context.Context) error {
+			current, err := h.deps.Assets.GetByPath(ctx, repo.Name, manifestPath(image, ref))
+			if err != nil {
+				return err
+			}
+			// A concurrent tag replacement was not revalidated by this response.
+			if current.SHA256 != cached.SHA256 || !current.LastModified.Equal(cached.LastModified) {
+				return nil
+			}
+			return h.deps.Assets.TouchLastModified(ctx, current.ID)
+		}); err != nil {
 			// The verified bytes remain valid; leave freshness stale so the next
 			// request can revalidate again if the timestamp update failed.
 			repoproxy.LogCacheRefreshError(ctx, repo.Name, cached.Path, err)
@@ -89,6 +99,10 @@ func (h *Handler) proxyManifestLocked(ctx context.Context, c *gin.Context, repo 
 		return h.manifestUpstreamStatus(c, repo, image, ref, resp, cached, body, compatible)
 	}
 	return h.serveFetchedManifest(ctx, c, repo, image, ref, resp)
+}
+
+func (h *Handler) withManifestLock(ctx context.Context, repo *domain.Repository, image, ref string, fn func(context.Context) error) error {
+	return h.deps.Assets.WithBlobKeyLock(ctx, "oci:manifest:"+repo.Name+":"+manifestPath(image, ref), fn)
 }
 
 func (h *Handler) serveFetchedManifest(ctx context.Context, c *gin.Context, repo *domain.Repository, image, ref string, resp *http.Response) error {
@@ -110,7 +124,25 @@ func (h *Handler) serveFetchedManifest(ctx context.Context, c *gin.Context, repo
 		dockerError(c, http.StatusNotAcceptable, "MANIFEST_UNKNOWN", "upstream manifest media type is not acceptable")
 		return nil
 	}
-	asset, storeErr := h.persistManifest(ctx, repo, image, ref, ct, body, nil)
+	var asset *domain.Asset
+	storeErr := h.withManifestLock(ctx, repo, image, ref, func(ctx context.Context) error {
+		// Another instance may have filled or repaired the tag during the fetch.
+		// Pin its current bytes before replacing it, never the earlier snapshot.
+		if !strings.Contains(ref, ":") {
+			current, held, err := h.cachedManifest(ctx, repo.Name, manifestPath(image, ref), true)
+			if err != nil {
+				return err
+			}
+			if current != nil {
+				if _, err := h.persistManifest(ctx, repo, image, ref, current.ContentType, held, current); err != nil {
+					return err
+				}
+			}
+		}
+		var err error
+		asset, err = h.persistManifest(ctx, repo, image, ref, ct, body, nil)
+		return err
+	})
 	if storeErr != nil {
 		// Preserve proxy pass-through at full quota, but only if these exact bytes
 		// can be fetched by digest upstream. A tag-only variant must be persisted
