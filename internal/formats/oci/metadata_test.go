@@ -261,26 +261,6 @@ func pullTag(t *testing.T, r *gin.Engine, repoName, tag string) string {
 	return w.Body.String()
 }
 
-// Proxy manifests must be bounded before any successful response or cache write.
-func TestProxyManifest_RejectsOversizedManifest(t *testing.T) {
-	body := `{"schemaVersion":2,"pad":"` + strings.Repeat("x", 5<<20) + `"}`
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
-		_, _ = w.Write([]byte(body))
-	}))
-	defer upstream.Close()
-	repo := &domain.Repository{ID: "r6", Name: "oci-proxy", Format: domain.FormatOCI, Type: domain.TypeProxy,
-		ProxyConfig: map[string]any{"remote_url": upstream.URL}}
-	r, d := setupWithDeps(repo)
-	req := httptest.NewRequest(http.MethodGet, "/repository/oci-proxy/v2/charts/nginx/manifests/1.2.3", nil)
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-	require.Equal(t, http.StatusBadGateway, w.Code)
-	keys, err := d.BlobStore.ListKeys(context.Background())
-	require.NoError(t, err)
-	require.Empty(t, keys)
-}
-
 // A mutable tag re-pointed upstream must re-type the component: the cached blob
 // now holds a different manifest, so metadata describing the old one is wrong.
 func TestProxyManifest_RetypesRepointedTag(t *testing.T) {

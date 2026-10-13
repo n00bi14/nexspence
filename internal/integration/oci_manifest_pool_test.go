@@ -28,10 +28,11 @@ import (
 
 func TestProxyOCI_ManifestSmallPool_RealShape(t *testing.T) {
 	for _, tc := range []struct {
-		name                                    string
-		parallel, mixed, shared, quota, blocked bool
+		name                                           string
+		parallel, mixed, shared, quota, blocked, large bool
 	}{
 		{name: "blocked_upstream", parallel: true, mixed: true, blocked: true},
+		{name: "large_quota", parallel: true, quota: true, large: true},
 		{name: "single"}, {name: "same", parallel: true}, {name: "different", parallel: true, mixed: true},
 		{name: "shared_digest_quota", parallel: true, mixed: true, shared: true, quota: true},
 		{name: "same_quota", parallel: true, quota: true}, {name: "different_quota", parallel: true, mixed: true, quota: true},
@@ -42,7 +43,11 @@ func TestProxyOCI_ManifestSmallPool_RealShape(t *testing.T) {
 			name := "manifest-pool-" + tc.name
 			const ct = "application/vnd.oci.image.index.v1+json"
 			bodyFor := func(ref string) string {
-				return fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[],"annotations":{"version":%q}}`, ct, ref)
+				padding := ""
+				if tc.large {
+					padding = strings.Repeat("x", 5<<20)
+				}
+				return fmt.Sprintf(`{"schemaVersion":2,"mediaType":%q,"manifests":[],"annotations":{"version":%q},"padding":%q}`, ct, ref, padding)
 			}
 			initialBody := func(ref string) string {
 				if tc.shared && ref == "two" {
@@ -117,14 +122,22 @@ func TestProxyOCI_ManifestSmallPool_RealShape(t *testing.T) {
 				t.Cleanup(cancel)
 				router := api.NewRouter(appCtx, cfg, small, logger.New("error", "json"), "manifest-pool-test")
 				ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					requestCtx, stop := context.WithTimeout(r.Context(), 3*time.Second)
+					timeout := 3 * time.Second
+					if tc.large {
+						timeout = 30 * time.Second
+					}
+					requestCtx, stop := context.WithTimeout(r.Context(), timeout)
 					defer stop()
 					router.ServeHTTP(w, r.WithContext(requestCtx))
 				}))
 				t.Cleanup(ts.Close)
 				urls = append(urls, ts.URL)
 			}
-			client := &http.Client{Timeout: 5 * time.Second}
+			clientTimeout := 5 * time.Second
+			if tc.large {
+				clientTimeout = 45 * time.Second
+			}
+			client := &http.Client{Timeout: clientTimeout}
 			fetch := func(url, ref, want string) error {
 				req, err := http.NewRequest(http.MethodGet, url+"/v2/repository/"+name+"/library/test/manifests/"+ref, nil)
 				if err != nil {
@@ -151,6 +164,9 @@ func TestProxyOCI_ManifestSmallPool_RealShape(t *testing.T) {
 			n := 1
 			if tc.parallel {
 				n = 16
+				if tc.large {
+					n = 4
+				}
 			}
 			results := make(chan error, n)
 			start := make(chan struct{})

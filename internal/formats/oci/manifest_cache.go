@@ -1,11 +1,7 @@
 package oci
 
 import (
-	"bytes"
 	"context"
-	"crypto/md5"  //nolint:gosec // artifact checksum
-	"crypto/sha1" //nolint:gosec // artifact checksum
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"strings"
@@ -16,7 +12,7 @@ import (
 	"github.com/nexspence-oss/nexspence/internal/storage"
 )
 
-func (h *Handler) cachedManifest(ctx context.Context, repoName, p string, strictType bool) (*domain.Asset, []byte, error) {
+func (h *Handler) cachedManifest(ctx context.Context, repoName, p string, strictType bool) (*domain.Asset, *manifestBody, error) {
 	asset, err := h.deps.Assets.GetByPath(ctx, repoName, p)
 	if errors.Is(err, repository.ErrNotFound) {
 		return nil, nil, nil
@@ -33,27 +29,28 @@ func (h *Handler) cachedManifest(ctx context.Context, repoName, p string, strict
 		return nil, nil, nil
 	} // missing blob: repair from upstream
 	defer func() { _ = rc.Close() }()
-	body, err := readManifest(rc)
+	body, err := spoolManifest(rc)
 	if err != nil {
 		return nil, nil, nil
 	}
-	ct, err := manifestContentType(body, asset.ContentType)
+	ct, err := body.contentType(asset.ContentType)
 	if err != nil && !strictType {
 		// Hosted manifests written without Content-Type historically defaulted to
 		// Docker even for OCI bodies. Recover the actual type without changing bytes.
-		ct, err = manifestContentType(body, "")
+		ct, err = body.contentType("")
 	}
-	sum := fmt.Sprintf("%x", sha256.Sum256(body))
+	sum := body.sha256
 	if err != nil || (asset.SHA256 != "" && sum != asset.SHA256) || (strings.Contains(p[strings.LastIndex(p, "/")+1:], ":") && !strings.HasSuffix(p, "/sha256:"+sum)) {
+		body.Close()
 		return nil, nil, nil
 	}
 	verified := *asset
-	verified.SHA256, verified.ContentType, verified.SizeBytes = sum, ct, int64(len(body))
+	verified.SHA256, verified.ContentType, verified.SizeBytes = sum, ct, body.size
 	return &verified, body, nil
 }
 
-func (h *Handler) persistManifest(ctx context.Context, repo *domain.Repository, image, ref, ct string, body []byte, pin *domain.Asset) (*domain.Asset, error) {
-	sum := fmt.Sprintf("%x", sha256.Sum256(body))
+func (h *Handler) persistManifest(ctx context.Context, repo *domain.Repository, image, ref, ct string, body *manifestBody, pin *domain.Asset) (*domain.Asset, error) {
+	sum := body.sha256
 	digestRef := "sha256:" + sum
 	fp := manifestPath(image, digestRef)
 	key := base.BlobKey(repo.Name, fp)
@@ -76,7 +73,7 @@ func (h *Handler) persistManifest(ctx context.Context, repo *domain.Repository, 
 				}
 				alias = nil
 			} else if alias.ContentType != ct {
-				alias, err = base.RegisterStoredBlob(ctx, h.deps, repo, fp, ct, base.Coords{Name: image, Version: digestRef}, key, sum, alias.SHA1, alias.MD5, int64(len(body)), alias.BlobStoreID, "")
+				alias, err = base.RegisterStoredBlob(ctx, h.deps, repo, fp, ct, base.Coords{Name: image, Version: digestRef}, key, sum, alias.SHA1, alias.MD5, body.size, alias.BlobStoreID, "")
 				if err != nil {
 					return err
 				}
@@ -99,15 +96,15 @@ func (h *Handler) persistManifest(ctx context.Context, repo *domain.Repository, 
 				return fmt.Errorf("check manifest references: %w", countErr)
 			}
 			if count == 0 {
-				if qerr := base.CheckQuota(ctx, h.deps, repo, int64(len(body))); qerr != nil {
+				if qerr := base.CheckQuota(ctx, h.deps, repo, body.size); qerr != nil {
 					return qerr
 				}
 			}
-			if err := store.Put(ctx, key, bytes.NewReader(body), int64(len(body))); err != nil {
+			if err := store.Put(ctx, key, body.reader(), body.size); err != nil {
 				return fmt.Errorf("store manifest: %w", err)
 			}
 			alias, err = base.RegisterStoredBlob(ctx, h.deps, repo, fp, ct, base.Coords{Name: image, Version: digestRef}, key, sum,
-				fmt.Sprintf("%x", sha1.Sum(body)), fmt.Sprintf("%x", md5.Sum(body)), int64(len(body)), storeID, storeName) //nolint:gosec // artifact checksums
+				body.sha1, body.md5, body.size, storeID, storeName)
 			if err != nil {
 				if count, cerr := h.deps.Assets.CountByBlobKey(ctx, key, ""); cerr == nil && count == 0 {
 					_ = store.Delete(ctx, key)
@@ -118,7 +115,7 @@ func (h *Handler) persistManifest(ctx context.Context, repo *domain.Repository, 
 		}
 		result = alias
 		if ref != digestRef && !legacyCopy {
-			result, err = base.RegisterStoredBlob(ctx, h.deps, repo, manifestPath(image, ref), ct, base.Coords{Name: image, Version: ref}, alias.BlobKey, sum, alias.SHA1, alias.MD5, int64(len(body)), alias.BlobStoreID, "")
+			result, err = base.RegisterStoredBlob(ctx, h.deps, repo, manifestPath(image, ref), ct, base.Coords{Name: image, Version: ref}, alias.BlobKey, sum, alias.SHA1, alias.MD5, body.size, alias.BlobStoreID, "")
 			if err != nil {
 				return err
 			}
@@ -129,12 +126,10 @@ func (h *Handler) persistManifest(ctx context.Context, repo *domain.Repository, 
 	return result, err
 }
 
-func (h *Handler) typeManifest(ctx context.Context, asset *domain.Asset, body []byte) {
-	if meta, ok := parseManifestMeta(body); ok {
-		extra := extraFrom(meta)
-		extra[extraSourceDigestKey] = asset.SHA256
-		_ = h.deps.Components.UpdateExtra(ctx, asset.ComponentID, extra)
-	}
+func (h *Handler) typeManifest(ctx context.Context, asset *domain.Asset, body *manifestBody) {
+	extra := extraFrom(body.meta)
+	extra[extraSourceDigestKey] = asset.SHA256
+	_ = h.deps.Components.UpdateExtra(ctx, asset.ComponentID, extra)
 }
 
 func (h *Handler) manifestStore(ctx context.Context, repo *domain.Repository, pin *domain.Asset) (string, string, storage.BlobStore, error) {
@@ -145,7 +140,7 @@ func (h *Handler) manifestStore(ctx context.Context, repo *domain.Repository, pi
 	return pin.BlobStoreID, "", store, err
 }
 
-func (h *Handler) manifestAliasReusable(ctx context.Context, alias, pin *domain.Asset, body []byte) (bool, error) {
+func (h *Handler) manifestAliasReusable(ctx context.Context, alias, pin *domain.Asset, body *manifestBody) (bool, error) {
 	store, err := base.AssetPhysicalStore(ctx, h.deps, alias)
 	if err != nil {
 		return false, err
@@ -167,6 +162,10 @@ func (h *Handler) manifestAliasReusable(ctx context.Context, alias, pin *domain.
 		return false, nil
 	}
 	defer func() { _ = rc.Close() }()
-	held, err := readManifest(rc)
-	return err == nil && bytes.Equal(held, body), nil
+	held, err := spoolManifest(rc)
+	if err != nil {
+		return false, nil
+	}
+	defer held.Close()
+	return held.sha256 == body.sha256 && held.size == body.size, nil
 }

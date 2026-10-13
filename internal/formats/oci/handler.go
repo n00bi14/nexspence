@@ -305,6 +305,7 @@ func manifestPath(imageName, reference string) string {
 
 func (h *Handler) pullManifest(c *gin.Context, repoName, imageName, reference string) {
 	asset, body, err := h.cachedManifest(c.Request.Context(), repoName, manifestPath(imageName, reference), false)
+	defer body.Close()
 	if err != nil {
 		dockerError(c, http.StatusInternalServerError, "UNKNOWN", err.Error())
 		return

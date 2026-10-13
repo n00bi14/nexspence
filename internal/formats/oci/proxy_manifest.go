@@ -1,9 +1,7 @@
 package oci
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"io"
 	"net/http"
@@ -31,7 +29,7 @@ func (h *Handler) proxyManifest(c *gin.Context, repo *domain.Repository, image, 
 	}
 	ctx := c.Request.Context()
 	var cached *domain.Asset
-	var body []byte
+	var body *manifestBody
 	var repairErr error
 	err := h.withManifestLock(ctx, repo, image, ref, func(ctx context.Context) error {
 		var err error
@@ -44,6 +42,7 @@ func (h *Handler) proxyManifest(c *gin.Context, repo *domain.Repository, image, 
 		}
 		return nil
 	})
+	defer body.Close()
 	if err != nil {
 		return err
 	}
@@ -106,18 +105,19 @@ func (h *Handler) withManifestLock(ctx context.Context, repo *domain.Repository,
 }
 
 func (h *Handler) serveFetchedManifest(ctx context.Context, c *gin.Context, repo *domain.Repository, image, ref string, resp *http.Response) error {
-	body, err := readManifest(resp.Body)
+	body, err := spoolManifest(resp.Body)
 	if err != nil {
 		return err
 	}
-	if resp.ContentLength >= 0 && resp.ContentLength != int64(len(body)) {
+	defer body.Close()
+	if resp.ContentLength >= 0 && resp.ContentLength != body.size {
 		return fmt.Errorf("truncated manifest response")
 	}
-	ct, err := manifestContentType(body, resp.Header.Get("Content-Type"))
+	ct, err := body.contentType(resp.Header.Get("Content-Type"))
 	if err != nil {
 		return err
 	}
-	if strings.Contains(ref, ":") && digestMismatch(ref, body) != "" {
+	if strings.Contains(ref, ":") && ref != "sha256:"+body.sha256 {
 		return fmt.Errorf("upstream manifest does not match requested digest")
 	}
 	if !acceptsManifest(manifestAccept(c), ct) {
@@ -133,6 +133,7 @@ func (h *Handler) serveFetchedManifest(ctx context.Context, c *gin.Context, repo
 			if err != nil {
 				return err
 			}
+			defer held.Close()
 			if current != nil {
 				if _, err := h.persistManifest(ctx, repo, image, ref, current.ContentType, held, current); err != nil {
 					return err
@@ -150,14 +151,14 @@ func (h *Handler) serveFetchedManifest(ctx context.Context, c *gin.Context, repo
 		if !h.manifestAvailableUpstream(ctx, repo, image, ct, body) {
 			return fmt.Errorf("persist manifest: %w", storeErr)
 		}
-		asset = &domain.Asset{ContentType: ct, SHA256: fmt.Sprintf("%x", sha256.Sum256(body)), SizeBytes: int64(len(body))}
+		asset = &domain.Asset{ContentType: ct, SHA256: body.sha256, SizeBytes: body.size}
 	}
 	h.respondManifest(c, repo, image, ref, asset, body)
 	return nil
 }
 
-func (h *Handler) manifestAvailableUpstream(ctx context.Context, repo *domain.Repository, image, ct string, body []byte) bool {
-	ref := fmt.Sprintf("sha256:%x", sha256.Sum256(body))
+func (h *Handler) manifestAvailableUpstream(ctx context.Context, repo *domain.Repository, image, ct string, body *manifestBody) bool {
+	ref := "sha256:" + body.sha256
 	resp, err := repoproxy.FetchUpstreamOnce(ctx, repo, "/v2/"+image+"/manifests/"+ref, "", http.Header{"Accept": []string{ct}})
 	if err != nil {
 		return false
@@ -166,15 +167,19 @@ func (h *Handler) manifestAvailableUpstream(ctx context.Context, repo *domain.Re
 	if resp.StatusCode != http.StatusOK {
 		return false
 	}
-	original, err := readManifest(resp.Body)
-	if err != nil || !bytes.Equal(body, original) {
+	original, err := spoolManifest(resp.Body)
+	if err != nil {
 		return false
 	}
-	actual, err := manifestContentType(original, resp.Header.Get("Content-Type"))
+	defer original.Close()
+	if original.sha256 != body.sha256 || original.size != body.size {
+		return false
+	}
+	actual, err := original.contentType(resp.Header.Get("Content-Type"))
 	return err == nil && actual == ct
 }
 
-func (h *Handler) respondManifest(c *gin.Context, repo *domain.Repository, image, ref string, asset *domain.Asset, body []byte) {
+func (h *Handler) respondManifest(c *gin.Context, repo *domain.Repository, image, ref string, asset *domain.Asset, body *manifestBody) {
 	// Recheck after selecting and registering: a newly created digest alias must
 	// inherit the tag's scan gate, including a stricter group policy.
 	if !h.pullGateAllows(c, repo, image, ref) || !h.pullGateAllows(c, repo, image, "sha256:"+asset.SHA256) {
@@ -184,7 +189,7 @@ func (h *Handler) respondManifest(c *gin.Context, repo *domain.Repository, image
 	c.Header("Docker-Content-Digest", "sha256:"+asset.SHA256)
 	c.Header("Docker-Distribution-API-Version", "registry/2.0")
 	c.Header("Content-Type", asset.ContentType)
-	c.Header("Content-Length", strconv.Itoa(len(body)))
+	c.Header("Content-Length", strconv.FormatInt(body.size, 10))
 	etag := `"sha256:` + asset.SHA256 + `"`
 	c.Header("ETag", etag)
 	c.Header("X-Checksum-Sha256", asset.SHA256)
@@ -208,10 +213,11 @@ func (h *Handler) respondManifest(c *gin.Context, repo *domain.Repository, image
 	if asset.ID != "" && h.deps.Downloads != nil {
 		h.deps.Downloads.Add(asset.ID)
 	}
-	c.Data(http.StatusOK, asset.ContentType, body)
+	c.Status(http.StatusOK)
+	_, _ = io.Copy(c.Writer, body.reader())
 }
 
-func (h *Handler) manifestUpstreamStatus(c *gin.Context, repo *domain.Repository, image, ref string, resp *http.Response, cached *domain.Asset, body []byte, compatible bool) error {
+func (h *Handler) manifestUpstreamStatus(c *gin.Context, repo *domain.Repository, image, ref string, resp *http.Response, cached *domain.Asset, body *manifestBody, compatible bool) error {
 	if compatible {
 		repoproxy.DispatchProxyError(h.deps, repo.Name, manifestPath(image, ref), "/v2/"+image+"/manifests/"+ref, fmt.Errorf("manifest upstream status %d", resp.StatusCode))
 		h.respondManifest(c, repo, image, ref, cached, body)
