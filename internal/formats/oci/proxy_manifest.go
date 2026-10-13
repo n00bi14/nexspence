@@ -30,6 +30,11 @@ func (h *Handler) proxyManifest(c *gin.Context, repo *domain.Repository, image, 
 		return nil
 	}
 	return h.deps.Assets.WithBlobKeyLock(c.Request.Context(), "oci:manifest:"+repo.Name+":"+manifestPath(image, ref), func(ctx context.Context) error {
+		// Pull gates also query through the request context. Keep every read
+		// inside the lock scope on the same database connection.
+		request := c.Request
+		c.Request = request.WithContext(ctx)
+		defer func() { c.Request = request }()
 		return h.proxyManifestLocked(ctx, c, repo, image, ref)
 	})
 }
