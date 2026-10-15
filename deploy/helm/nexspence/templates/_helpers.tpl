@@ -73,7 +73,7 @@ A new name makes this a create, and leaves the Bitnami PVC available to dump.
 
 {{- define "nexspence.postgresql.selectorLabels" -}}
 app.kubernetes.io/name: {{ include "nexspence.name" . }}-postgres
-app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/instance: {{ .Release.Name | quote }}
 app.kubernetes.io/component: postgresql
 {{- end }}
 

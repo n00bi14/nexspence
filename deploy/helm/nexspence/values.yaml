@@ -404,6 +404,13 @@ extraVolumeMounts: []
 # Bitnami path postgresql.primary.persistence).
 postgresql:
   enabled: true
+  # -- Set to true only after following "Leaving the former Bitnami
+  # sub-chart" in the chart README. While a Bitnami `{release}-postgresql`
+  # StatefulSet still exists, `helm upgrade` refuses to render: the new
+  # `{release}-postgres` database would start empty and the instance would
+  # look wiped. The check is a cluster lookup, so `helm template` and
+  # GitOps renderers never trip it.
+  acknowledgeBitnamiMigration: false
   image:
     repository: docker.io/library/postgres
     tag: "18-bookworm"

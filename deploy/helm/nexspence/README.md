@@ -141,7 +141,7 @@ helm install nexspence \
 
 To keep the DSN out of values, put it in a Secret and set
 `externalDatabase.existingSecret` (key `dsn` by default, override with
-`existingSecretDsnKey`). The bundled chart can likewise take
+`existingSecretKey`). The bundled chart can likewise take
 `postgresql.auth.existingSecret` / `existingSecretPasswordKey` instead of
 `postgresql.auth.password`.
 
@@ -459,6 +459,13 @@ It also will not magically convert the data directory. Do this instead:
 2. Uninstall the release, or delete the old Bitnami StatefulSet / Service /
    Secret. Kubernetes keeps volumeClaimTemplates PVCs when the StatefulSet
    goes away, so `data-nexspence-postgresql-0` remains as a dump source.
+
+   While the Bitnami StatefulSet `nexspence-postgresql` still exists,
+   `helm upgrade` stops with an error instead of starting an empty database.
+   If you have already dumped and want to keep the old StatefulSet around for
+   now, add `--set postgresql.acknowledgeBitnamiMigration=true`. The check is
+   a cluster lookup: `helm template`, Argo CD and Flux never run it, so on
+   GitOps follow these steps by hand.
 
 3. Re-install this chart. The new StatefulSet is `nexspence-postgres`
    (PVC `data-nexspence-postgres-0`). If you previously set Bitnami values
