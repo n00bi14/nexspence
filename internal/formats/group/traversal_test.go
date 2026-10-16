@@ -76,6 +76,37 @@ func TestGroupHandler_TraversalSegmentRejected(t *testing.T) {
 	assert.Equal(t, "fine", rec2.Body.String())
 }
 
+// The member serves path.Clean of the path, so every spelling it would clean
+// is a second name for the blocked artifact — not only "..". An empty segment,
+// a "." segment and an encoded "/" or "." all have to be refused too.
+func TestGroupHandler_RoutingRule_NonCanonicalSpellingDoesNotBypassBlock(t *testing.T) {
+	rule := makeBlockRule("rule-spelling", `^/private/`)
+
+	member := testutil.SimpleRepo("secrets2", "raw")
+	ruleID := "rule-spelling"
+	grp := &domain.Repository{
+		ID: "repo-grp-s", Name: "sgroup", Format: "raw",
+		Type: domain.TypeGroup, Online: true,
+		RoutingRuleID: &ruleID,
+		FormatConfig:  map[string]any{"member_names": []any{"secrets2"}},
+	}
+
+	r := buildEngineWithRule(rule, member, grp)
+	require.Equal(t, http.StatusCreated, put(r, "secrets2", "/private/secret.txt", "TOPSECRET"))
+
+	for _, url := range []string{
+		"/repository/sgroup//private/secret.txt",
+		"/repository/sgroup/./private/secret.txt",
+		"/repository/sgroup/%2e/private/secret.txt",
+		"/repository/sgroup/%2Fprivate/secret.txt",
+	} {
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, url, nil))
+		assert.Equal(t, http.StatusBadRequest, rec.Code, url)
+		assert.NotContains(t, rec.Body.String(), "TOPSECRET", "%s leaked the blocked content", url)
+	}
+}
+
 // A group rule that cannot be loaded is not a group without a rule: the
 // lookup failing must not open every path the rule was there to refuse.
 func TestGroupHandler_RoutingRule_LookupFailureFailsClosed(t *testing.T) {

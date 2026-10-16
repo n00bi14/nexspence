@@ -46,3 +46,21 @@ func TestProxyRuleAllows_RuleLookupFails_Refuses(t *testing.T) {
 
 	assert.False(t, formats.ProxyRuleAllows(ctx, rules, proxy, http.MethodGet, "/org/x/1/x-1.jar"))
 }
+
+// The handler serves path.Clean of the path, so the rule judges that string,
+// and a spelling the handler would rewrite is refused rather than judged.
+func TestProxyRuleAllows_NonCanonicalSpelling_Refuses(t *testing.T) {
+	ctx := context.Background()
+	rules := testutil.NewRoutingRuleRepo()
+	_ = rules.Create(ctx, &domain.RoutingRule{ID: "rr", Mode: "BLOCK", Matchers: []string{`^/private/`, `\.jar$`}})
+	id := "rr"
+	proxy := &domain.Repository{Name: "central", Type: domain.TypeProxy, RoutingRuleID: &id}
+
+	for _, p := range []string{
+		"//private/x", "/./private/x", "/a/../private/x",
+		"/lib.jar/", // served as /lib.jar
+	} {
+		assert.False(t, formats.ProxyRuleAllows(ctx, rules, proxy, http.MethodGet, p), p)
+	}
+	assert.True(t, formats.ProxyRuleAllows(ctx, rules, proxy, http.MethodGet, "/public/x/"))
+}
