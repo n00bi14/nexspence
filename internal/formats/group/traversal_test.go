@@ -1,6 +1,8 @@
 package group_test
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -72,4 +74,27 @@ func TestGroupHandler_TraversalSegmentRejected(t *testing.T) {
 	r.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/repository/pgroup/ok/we..ird.txt", nil))
 	assert.Equal(t, http.StatusOK, rec2.Code)
 	assert.Equal(t, "fine", rec2.Body.String())
+}
+
+// A group rule that cannot be loaded is not a group without a rule: the
+// lookup failing must not open every path the rule was there to refuse.
+func TestGroupHandler_RoutingRule_LookupFailureFailsClosed(t *testing.T) {
+	member := testutil.SimpleRepo("open1", "raw")
+	ruleID := "rule-broken"
+	grp := &domain.Repository{
+		ID: "repo-grp-b", Name: "bgroup", Format: "raw",
+		Type: domain.TypeGroup, Online: true,
+		RoutingRuleID: &ruleID,
+		FormatConfig:  map[string]any{"member_names": []any{"open1"}},
+	}
+	rules := testutil.NewRoutingRuleRepo()
+	_ = rules.Create(context.Background(), makeBlockRule(ruleID, `^/private/`))
+	r := buildEngineWithRuleRepo(rules, member, grp)
+	require.Equal(t, http.StatusCreated, put(r, "open1", "/private/secret.txt", "TOPSECRET"))
+
+	rules.Err = errors.New("database unavailable")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/repository/bgroup/private/secret.txt", nil))
+	assert.NotEqual(t, http.StatusOK, rec.Code)
+	assert.NotContains(t, rec.Body.String(), "TOPSECRET")
 }

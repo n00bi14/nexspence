@@ -15,8 +15,11 @@ import (
 // which paths are fetched from remote_url: a refused path is not served from
 // the cache either, and in a group it is a miss, so a hosted member can still
 // serve it. Hosted repositories ignore rules, and a group's own rule is
-// applied by the group handler. A rule that no longer resolves counts as none,
-// as it does on a group.
+// applied by the group handler.
+//
+// Evaluation fails closed: a rule that cannot be loaded refuses every path
+// (repositories.routing_rule_id is ON DELETE SET NULL, so a lookup error is a
+// failing database, not a deleted rule).
 func ProxyRuleAllows(ctx context.Context, rules repository.RoutingRuleRepo, repo *domain.Repository, method, path string) bool {
 	if rules == nil || repo == nil || repo.Type != domain.TypeProxy || repo.RoutingRuleID == nil {
 		return true
@@ -25,8 +28,8 @@ func ProxyRuleAllows(ctx context.Context, rules repository.RoutingRuleRepo, repo
 		return true
 	}
 	rule, err := rules.Get(ctx, *repo.RoutingRuleID)
-	if err != nil {
-		return true
+	if err != nil || rule == nil {
+		return false
 	}
 	return rule.Allows(path)
 }

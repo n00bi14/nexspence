@@ -2,6 +2,7 @@ package formats_test
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"testing"
 
@@ -28,7 +29,20 @@ func TestProxyRuleAllows(t *testing.T) {
 	assert.True(t, formats.ProxyRuleAllows(ctx, rules, proxy, http.MethodGet, "/org/x/1/x-1.jar"))
 	assert.True(t, formats.ProxyRuleAllows(ctx, rules, proxy, http.MethodPut, blocked), "only reads are routed")
 	assert.True(t, formats.ProxyRuleAllows(ctx, rules, hosted, http.MethodGet, blocked), "hosted ignores rules")
-	assert.True(t, formats.ProxyRuleAllows(ctx, rules, dangling, http.MethodGet, blocked), "missing rule = no rule")
+	assert.False(t, formats.ProxyRuleAllows(ctx, rules, dangling, http.MethodGet, blocked), "a rule that cannot be loaded refuses")
 	assert.True(t, formats.ProxyRuleAllows(ctx, rules, plain, http.MethodGet, blocked))
 	assert.True(t, formats.ProxyRuleAllows(ctx, nil, proxy, http.MethodGet, blocked), "no rule repo wired")
+}
+
+// AGENTS.md: filter evaluation fails closed. A rule lookup that errors is not
+// a proxy without a rule — every path would reach the upstream.
+func TestProxyRuleAllows_RuleLookupFails_Refuses(t *testing.T) {
+	ctx := context.Background()
+	rules := testutil.NewRoutingRuleRepo()
+	_ = rules.Create(ctx, &domain.RoutingRule{ID: "rr", Mode: "BLOCK", Matchers: []string{`^/com/acme/`}})
+	rules.Err = errors.New("database unavailable")
+	id := "rr"
+	proxy := &domain.Repository{Name: "central", Type: domain.TypeProxy, RoutingRuleID: &id}
+
+	assert.False(t, formats.ProxyRuleAllows(ctx, rules, proxy, http.MethodGet, "/org/x/1/x-1.jar"))
 }

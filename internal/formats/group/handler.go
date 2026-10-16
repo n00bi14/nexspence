@@ -94,7 +94,14 @@ func (h *Handler) serveGet(c *gin.Context) {
 
 	var rule *domain.RoutingRule
 	if repoDef.RoutingRuleID != nil && h.deps.RoutingRules != nil {
-		rule, _ = h.deps.RoutingRules.Get(ctx, *repoDef.RoutingRuleID)
+		// Fails closed: a rule that cannot be loaded is not a group without a
+		// rule (routing_rule_id is ON DELETE SET NULL, so this is a failing
+		// database, not a deleted rule).
+		rule, err = h.deps.RoutingRules.Get(ctx, *repoDef.RoutingRuleID)
+		if err != nil || rule == nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "routing rule check failed"})
+			return
+		}
 	}
 
 	// Index documents are merged across ALL members (member order = priority)
