@@ -99,6 +99,7 @@ func TestGroupHandler_RoutingRule_NonCanonicalSpellingDoesNotBypassBlock(t *test
 		"/repository/sgroup/./private/secret.txt",
 		"/repository/sgroup/%2e/private/secret.txt",
 		"/repository/sgroup/%2Fprivate/secret.txt",
+		"/repository/sgroup/%252e%252e/private/secret.txt",
 	} {
 		rec := httptest.NewRecorder()
 		r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, url, nil))

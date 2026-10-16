@@ -109,6 +109,8 @@ func TestRBACMiddleware_RefusesNonCanonicalSpelling(t *testing.T) {
 			"/pub/./private/x",
 			"/pub/%2e/private/x",
 			"/pub/%2Fprivate/x",
+			"/pub/%252e%252e/%252e%252e/other/x",
+			"/pub/a%252Fb/x",
 		} {
 			w := httptest.NewRecorder()
 			r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, prefix+spelling, nil))

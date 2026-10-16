@@ -57,7 +57,7 @@ func TestProxyRuleAllows_NonCanonicalSpelling_Refuses(t *testing.T) {
 	proxy := &domain.Repository{Name: "central", Type: domain.TypeProxy, RoutingRuleID: &id}
 
 	for _, p := range []string{
-		"//private/x", "/./private/x", "/a/../private/x",
+		"//private/x", "/./private/x", "/%2e/private/x", "/%2Fprivate/x", "/a/%2e%2e/private/x",
 		"/lib.jar/", // served as /lib.jar
 	} {
 		assert.False(t, formats.ProxyRuleAllows(ctx, rules, proxy, http.MethodGet, p), p)

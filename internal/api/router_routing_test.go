@@ -104,6 +104,7 @@ func TestServeRepository_ProxyRoutingRule_NonCanonicalSpellingRefused(t *testing
 		"/repository/p/./private/x",
 		"/repository/p/%2e/private/x",
 		"/repository/p/%2Fprivate/x",
+		"/repository/p/%252e/private/x",
 	} {
 		w := httptest.NewRecorder()
 		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, target, nil))

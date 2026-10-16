@@ -33,7 +33,8 @@ func TestCanonicalPath_ReturnsServedSpelling(t *testing.T) {
 
 // Every spelling a format handler's path.Clean would rewrite names an artifact
 // a second way, and a check judged on the first name does not hold for the
-// second.
+// second. Double-encoded dots matter even though nothing here decodes twice:
+// the proxy hands the path to an upstream that decodes it once more.
 func TestCanonicalPath_RefusesSecondSpelling(t *testing.T) {
 	for _, in := range []string{
 		"//private/x",
@@ -42,6 +43,14 @@ func TestCanonicalPath_RefusesSecondSpelling(t *testing.T) {
 		"/a/.",
 		"/a/..",
 		"/a/../b",
+		"/%2e/x",
+		"/%2E%2e/x",
+		"/.%2e/x",
+		"/%252e%252e/x",
+		"/%25252e/x",
+		"/%2Fprivate/x",
+		"/%2fprivate/x",
+		"/a%252Fb/x",
 	} {
 		_, err := formats.CanonicalPath(in)
 		assert.ErrorIs(t, err, formats.ErrNonCanonicalPath, in)
